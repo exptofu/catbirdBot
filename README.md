@@ -30,14 +30,14 @@ python bot.py
 ## GroupMe setup
 
 1. Copy the access token from <https://dev.groupme.com/applications> into `GROUPME_ACCESS_TOKEN`.
-2. Create one GroupMe bot per group you want to bridge, with the group's id as `bot[group_id]`:
+2. Optional: pre-create bots. `/bridge add` creates one automatically for each new group (name `GROUPME_BOT_NAME`, default "Catbird Bridge"), reusing the existing bot when the callback URL is already registered. To manage bots manually:
 
    ```powershell
    python utils/groupme_setup.py groups
    python utils/groupme_setup.py create-bot --group-id 12345678 --callback-url https://example.com/groupme/callback
    ```
 
-   The command prints the `bot_id` to use with `/bridge add`.
+   The command prints the `bot_id`, which can be passed to `/bridge add` instead of letting it create one.
 3. Choose a transport:
 
    | `GROUPME_MODE` | How GroupMe messages arrive | Requirements |
@@ -68,7 +68,7 @@ All commands require the **Administrator** permission (enforced both by Discord'
 
 | Command | Purpose |
 | --- | --- |
-| `/bridge add group_id channel [bot_id] [topic]` | Create a bridge, create the channel webhook, and baseline the conversation so old history is not replayed. Accepts a group id or a `groupme.com` join link. `bot_id` is required for a group bridge; `topic` (a topic name or id) creates a topic bridge instead. Re-running it for an already bridged group updates that bridge. |
+| `/bridge add group_id channel [bot_id] [topic]` | Create a bridge, create the channel webhook, and baseline the conversation so old history is not replayed. Accepts a group id or a `groupme.com` join link. With `GROUPME_ACCESS_TOKEN` set, `bot_id` is optional: the bot is created for that group automatically (or the existing one is reused when the callback URL is already registered). `topic` (a topic name or id) creates a topic bridge instead. Re-running it for an already bridged group updates that bridge. |
 | `/bridge topics group_id` | List the group's topics with their ids and message counts. |
 | `/bridge set-topic group_id topic` | Point an existing bridge at a topic, or pass `none` to go back to the main chat. |
 | `/bridge list` | Show every group/topic, channel, and poster pairing. |

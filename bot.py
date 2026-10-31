@@ -83,6 +83,8 @@ IMAGE_JPEG_QUALITY = min(95, max(50, int(os.environ.get("IMAGE_JPEG_QUALITY", "8
 # Originals are read up to this size so they can be compressed; bigger ones are dropped.
 IMAGE_SOURCE_LIMIT_BYTES = max(IMAGE_UPLOAD_LIMIT_BYTES * 8, 32 * 1024 * 1024)
 WEBHOOK_NAME = "GroupMe Bridge"
+GROUPME_BOT_NAME = os.environ.get("GROUPME_BOT_NAME", "Catbird Bridge").strip() or "Catbird Bridge"
+GROUPME_BOT_AVATAR_URL = os.environ.get("GROUPME_BOT_AVATAR_URL", "").strip()
 LINK_GROUPME = "groupme_to_discord"
 IMAGE_TYPES = {
     "image/jpeg": "jpg",
@@ -379,7 +381,8 @@ class GroupMeError(Exception):
 
 
 def groupme_headers() -> dict[str, str]:
-    headers = {"Content-Type": "application/json"}
+    """Auth header only: aiohttp picks the content type from `json=` / `data=`."""
+    headers: dict[str, str] = {}
     if GROUPME_ACCESS_TOKEN:
         headers["X-Access-Token"] = GROUPME_ACCESS_TOKEN
     return headers
@@ -467,6 +470,44 @@ async def groupme_list_messages(
 
 async def groupme_list_bots(session: aiohttp.ClientSession) -> list[dict]:
     return await groupme_request(session, "GET", "/bots") or []
+
+
+async def groupme_create_bot(
+    session: aiohttp.ClientSession,
+    group_id: str,
+    name: str,
+    callback_url: str = "",
+    avatar_url: str = "",
+) -> dict:
+    """Create a posting bot for a group. GroupMe wraps the result in {"bot": {...}}."""
+    form = {
+        "bot[name]": name,
+        "bot[group_id]": str(group_id),
+        "bot[active]": "true",
+        "bot[dm_notification]": "false",
+    }
+    if callback_url:
+        form["bot[callback_url]"] = callback_url
+    if avatar_url:
+        form["bot[avatar_url]"] = avatar_url
+    response = await groupme_request(session, "POST", "/bots", form=form)
+    if isinstance(response, dict):
+        bot = response.get("bot")
+        return bot if isinstance(bot, dict) else response
+    return {}
+
+
+async def groupme_find_bot(
+    session: aiohttp.ClientSession, group_id: str, callback_url: str = ""
+) -> dict | None:
+    """Find an existing bot for a group, preferring one already pointed at our callback."""
+    bots = await groupme_list_bots(session)
+    group_bots = [bot for bot in bots if str(bot.get("group_id")) == str(group_id)]
+    if callback_url:
+        for bot in group_bots:
+            if bot.get("callback_url") == callback_url:
+                return bot
+    return group_bots[0] if group_bots else None
 
 
 async def groupme_post_bot(
@@ -1006,7 +1047,7 @@ async def require_manager(interaction: discord.Interaction) -> bool:
 @app_commands.describe(
     group_id="GroupMe group id (or a groupme.com join link)",
     channel="Discord text channel that mirrors the conversation",
-    bot_id="GroupMe bot id for group bridges (create one with utils/groupme_setup.py)",
+    bot_id="Optional GroupMe bot id; leave empty to create one automatically",
     topic="Optional GroupMe topic name or id: Discord posts go to this topic",
 )
 async def bridge_add(
@@ -1022,13 +1063,13 @@ async def bridge_add(
     bot_id = (bot_id or "").strip()
     topic_query = (topic or "").strip()
 
-    if not topic_query and not bot_id:
+    if not topic_query and not bot_id and not GROUPME_ACCESS_TOKEN:
         await interaction.response.send_message(
             embed=discord.Embed(
-                title="⚠️ Missing GroupMe bot",
+                title="⚠️ Cannot create a GroupMe bot",
                 description=(
-                    "A group bridge needs a `bot_id`. A topic bridge can leave it out, "
-                    "but then `topic` is required."
+                    "`bot_id` is optional only when `GROUPME_ACCESS_TOKEN` is set, "
+                    "because the bot creates one for you. Pass a `bot_id` instead."
                 ),
                 color=discord.Color.orange(),
             ),
@@ -1126,6 +1167,79 @@ async def bridge_add(
             "Topic bridges post with `GROUPME_ACCESS_TOKEN`, so Discord messages appear "
             "from the authenticated GroupMe account, not a bot."
         )
+
+    if topic_row is None:
+        if bot_id:
+            # Validate an explicit id so a typo does not fail later with a 404 on post.
+            if GROUPME_ACCESS_TOKEN:
+                try:
+                    bots = await groupme_list_bots(session)
+                except GroupMeError:
+                    bots = []
+                if bots and not any(str(b.get("bot_id")) == bot_id for b in bots):
+                    warnings.append(
+                        f"Bot `{bot_id}` was not found on this GroupMe account; "
+                        "posting may fail with 404."
+                    )
+        else:
+            # No bot id given: create one for this group, or reuse the existing one.
+            try:
+                created = await groupme_create_bot(
+                    session,
+                    group_id,
+                    GROUPME_BOT_NAME,
+                    callback_url(),
+                    GROUPME_BOT_AVATAR_URL,
+                )
+                bot_id = str(created.get("bot_id") or "")
+                if not bot_id:
+                    raise GroupMeError("GroupMe returned no bot id")
+                warnings.append(f"Created GroupMe bot **{GROUPME_BOT_NAME}** (`{bot_id}`).")
+            except GroupMeError as error:
+                if error.status == 400 and "already registered" in str(error).lower():
+                    try:
+                        existing = await groupme_find_bot(session, group_id, callback_url())
+                    except GroupMeError:
+                        existing = None
+                    if existing and existing.get("bot_id"):
+                        bot_id = str(existing["bot_id"])
+                        warnings.append(
+                            f"Reusing the existing GroupMe bot `{bot_id}` for this group."
+                        )
+                    else:
+                        await interaction.followup.send(
+                            embed=discord.Embed(
+                                title="❌ Bot creation failed",
+                                description=(
+                                    "GroupMe says this callback URL is already registered for "
+                                    "the group, but no matching bot could be listed. Create a bot "
+                                    "with `utils/groupme_setup.py` and pass its `bot_id`."
+                                ),
+                                color=discord.Color.red(),
+                            ),
+                            ephemeral=True,
+                        )
+                        return
+                else:
+                    hint = (
+                        " Check that `GROUPME_ACCESS_TOKEN` belongs to a group member."
+                        if error.status in (401, 403)
+                        else ""
+                    )
+                    await interaction.followup.send(
+                        embed=discord.Embed(
+                            title="❌ Bot creation failed",
+                            description=f"GroupMe rejected the request: `{error}`.{hint}",
+                            color=discord.Color.red(),
+                        ),
+                        ephemeral=True,
+                    )
+                    return
+            if not callback_url() and GROUPME_MODE == "webhook":
+                warnings.append(
+                    "The new bot has no callback URL yet; set one to the tunnel URL so "
+                    "group messages arrive."
+                )
 
     try:
         webhook = await channel.create_webhook(name=WEBHOOK_NAME, reason="Catbird GroupMe bridge")

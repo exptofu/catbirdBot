@@ -1,0 +1,27 @@
+[Unit]
+Description=Catbird GroupMe <-> Discord Bridge Bot
+Documentation=file:/opt/catbirdBot/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=catbird
+Group=catbird
+WorkingDirectory=/opt/catbirdBot
+ExecStart=/opt/catbirdBot/.venv/bin/python /opt/catbirdBot/bot.py
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+# bot.py loads /opt/catbirdBot/.env itself via python-dotenv, so .env is not
+# read by systemd. Uncomment only if you prefer systemd to own the variables.
+#EnvironmentFile=-/opt/catbirdBot/.env
+# SIGINT unwinds discord.py's `async with self`, so Client.__aexit__ awaits
+# Bot.close() (closes the ngrok tunnel and the aiohttp callback server).
+# SIGTERM would kill the process without that cleanup.
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

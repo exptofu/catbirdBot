@@ -14,3 +14,5 @@
 - Preserve GroupMe request pacing/retries in `groupme_request` (429 + 5xx backoff, 304 means "no new messages").
 - Dependencies belong in `requirements.txt`. Avoid adding a dependency for behavior the standard library already handles.
 - Reusable scripts live in `utils/` (setup, bridge creation, bot maintenance, env sync, payload inspection) and checks in `tests/`. For Python edits run `python -m py_compile bot.py utils\*.py tests\*.py`, then `python tests\smoke.py` and `python tests\integration.py` (the integration test runs against a local fake GroupMe API on port 8731 and a temp database).
+- Deployment lives in `deploy/`: `catbird-bot.service` runs `bot.py` from `/opt/catbirdBot` with `/opt/catbirdBot/.venv/bin/python` as the `catbird` user. Keep `WorkingDirectory` in sync with the paths in the README, and remember `deploy/` must stay tracked by git.
+- `requirements.txt` pins ngrok by interpreter: `ngrok>=1.4,<1.5` below Python 3.12 and `ngrok>=1.7` at 3.12+. Both SDKs support the same calls used in `start_tunnel`; do not raise the floor without checking `requires_python` on PyPI.

@@ -27,6 +27,34 @@ python bot.py
 
 `bot.py` needs the **Message Content** privileged intent enabled for the application in the Discord Developer Portal, plus `View Channel`, `Send Messages`, `Read Message History`, and `Manage Webhooks` in the bridged channels. The bot logs its invite URL on startup.
 
+## Deploy (systemd)
+
+`deploy/catbird-bot.service` runs the bot from `/opt/catbirdBot` as an unprivileged `catbird` user:
+
+```bash
+sudo useradd --system --home /opt/catbirdBot --shell /usr/sbin/nologin catbird
+sudo mkdir -p /opt/catbirdBot
+sudo rsync -a --exclude .venv --exclude .git ./ /opt/catbirdBot/
+cd /opt/catbirdBot
+sudo python3 -m venv .venv
+sudo .venv/bin/pip install -r requirements.txt
+sudo cp deploy/catbird-bot.service /etc/systemd/system/
+sudo chown -R catbird:catbird /opt/catbirdBot
+sudo chmod 600 /opt/catbirdBot/.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now catbird-bot
+```
+
+Create `.env` in `/opt/catbirdBot` before the first start (it is read by `python-dotenv`, not by systemd). `catbird.db` and the avatar file live in the same directory, so the service user needs write access there.
+
+```bash
+sudo systemctl status catbird-bot
+sudo journalctl -u catbird-bot -f      # logs (PYTHONUNBUFFERED=1, so no buffering)
+sudo systemctl restart catbird-bot
+```
+
+The unit uses `KillSignal=SIGINT` because `discord.py` shuts down on SIGINT through `Bot.close()`, which closes the ngrok tunnel and the aiohttp callback server before exit. `Restart=on-failure` with `RestartSec=10` covers crashes and transient network failures.
+
 ## GroupMe setup
 
 1. Copy the access token from <https://dev.groupme.com/applications> into `GROUPME_ACCESS_TOKEN`.
@@ -131,6 +159,7 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 | `utils/inspect_payloads.py` | Summarizes captured GroupMe callbacks (`groupme_payloads.jsonl`). |
 | `tests/smoke.py` | Fast checks for DB helpers, rendering, and topic matching. |
 | `tests/integration.py` | Offline end-to-end run against a fake GroupMe API (relays, images, bot recovery). |
+| `deploy/catbird-bot.service` | systemd unit that runs the bot from `/opt/catbirdBot` as the `catbird` user. |
 | `catbird.db` | SQLite store for bridges, poll cursors, and message links. Safe to delete only when every bridge can be recreated. |
 
 Run the checks with:

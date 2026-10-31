@@ -63,6 +63,11 @@ async def bots_create(request):
             {"meta": {"code": 400, "errors": ["group has too many bots"]}, "response": None},
             status=400,
         )
+    if form.get("bot[group_id]") == "UNAUTHORIZED":
+        return web.json_response(
+            {"meta": {"code": 401, "errors": ["unauthorized"]}, "response": None},
+            status=401,
+        )
     return web.json_response(
         {
             "response": {
@@ -146,6 +151,17 @@ async def group(request):
     )
 
 
+async def group_index(request):
+    return web.json_response(
+        {
+            "response": [
+                {"id": "G1", "name": "Testers"},
+                {"id": "G2", "name": "Topic Group"},
+            ]
+        }
+    )
+
+
 async def subgroups(request):
     return web.json_response(
         {
@@ -202,6 +218,7 @@ async def main():
     app.router.add_get("/groups/{group_id}/messages", group_messages)
     app.router.add_get("/groups/{group_id}/subgroups", subgroups)
     app.router.add_get("/groups/{group_id}", group)
+    app.router.add_get("/groups", group_index)
     app.router.add_post("/images/pictures", pictures)
     app.router.add_get("/cdn/a.png", cdn)
     app.router.add_get("/flaky", flaky)
@@ -259,6 +276,15 @@ async def main():
         bot_id, note = await bot.ensure_group_bot(session, "MAXBOTS")
         assert bot_id == "max-bot", (bot_id, note)
         assert "too many bots" in note, note
+
+        # 401 from POST /bots is how GroupMe answers a topic id or a bad token
+        bot_id, note = await bot.ensure_group_bot(session, "UNAUTHORIZED")
+        assert bot_id == "", (bot_id, note)
+        assert "401" in note and "unauthorized" in note, note
+
+        # ...and the account's group list is what tells the two apart
+        assert await bot.groupme_owns_group(session, "G1") is True
+        assert await bot.groupme_owns_group(session, "59716270") is False
 
         topics = await bot.groupme_list_subgroups(session, "G1")
         assert [t["topic"] for t in topics] == ["cobb", "dekalb"]

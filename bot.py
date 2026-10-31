@@ -539,6 +539,32 @@ async def groupme_get_group(session: aiohttp.ClientSession, group_id: str) -> di
     )
 
 
+async def groupme_owns_group(session: aiohttp.ClientSession, group_id: str) -> bool | None:
+    """Whether `group_id` is a group the access token is a member of.
+
+    Used to tell "this id is a topic, not a group" apart from "the token is bad":
+    `GET /groups/{id}` accepts a subgroup id, but `POST /bots` answers 401 for one
+    because topics cannot host bots. Returns None when that cannot be determined.
+    """
+    for page in range(1, 6):
+        try:
+            groups = await groupme_request(
+                session,
+                "GET",
+                "/groups",
+                params={"page": page, "per_page": 100, "omit": "memberships"},
+            )
+        except GroupMeError:
+            return None
+        if not isinstance(groups, list):
+            return None
+        if any(str(group.get("id")) == str(group_id) for group in groups):
+            return True
+        if len(groups) < 100:
+            return False
+    return None
+
+
 async def groupme_list_messages(
     session: aiohttp.ClientSession,
     group_id: str,
@@ -655,8 +681,8 @@ async def ensure_group_bot(
     # different app, or a per-group limit), and reusing it still beats no bridge.
     try:
         existing = await groupme_find_bot(session, group_id, callback_url())
-    except GroupMeError:
-        existing = None
+    except GroupMeError as error:
+        return "", f"{failure} Listing the account's bots also failed: `{error}`."
     bot_id = str((existing or {}).get("bot_id") or "")
     if not bot_id:
         return "", f"{failure} No existing bot for this group could be listed either."
@@ -1591,11 +1617,32 @@ async def bridge_add(
             if note:
                 warnings.append(note)
             if not resolved:
+                hint = ""
+                lowered = note.lower()
+                if "401" in lowered or "unauthor" in lowered:
+                    owned = await groupme_owns_group(session, group_id)
+                    if owned is False:
+                        hint = (
+                            f"\n\n`{group_id}` is not one of the groups this access token is "
+                            "in, so GroupMe will not let it host a bot. That usually means the "
+                            "id is a **topic** (subgroup) rather than a group: pass the parent "
+                            "group id and select the topic, "
+                            "`/bridge add group_id:<parent group> topic:<name>`. "
+                            "`/bridge topics group_id:<parent group>` lists them."
+                        )
+                    else:
+                        hint = (
+                            "\n\nGroupMe answers **401** for `POST /bots` when "
+                            "`GROUPME_ACCESS_TOKEN` is not valid for bot calls, and for topic "
+                            "(subgroup) ids, which cannot host bots. Copy a fresh token from "
+                            "https://dev.groupme.com/applications into `.env`, restart the bot, "
+                            "and use `topic:<name>` if you meant a topic."
+                        )
                 await interaction.followup.send(
                     embed=discord.Embed(
                         title="❌ Bot creation failed",
                         description=(
-                            f"{note}\n\n"
+                            f"{note}{hint}\n\n"
                             "Pass an existing `bot_id`, or create one with "
                             f"`python utils/groupme_setup.py create-bot --group-id {group_id} "
                             f"--callback-url {callback_url() or 'https://<your-host>' + GROUPME_WEBHOOK_PATH}` "

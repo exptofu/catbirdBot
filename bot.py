@@ -510,6 +510,11 @@ async def groupme_find_bot(
     return group_bots[0] if group_bots else None
 
 
+async def groupme_destroy_bot(session: aiohttp.ClientSession, bot_id: str) -> None:
+    """Remove a bot. GroupMe has no update endpoint, so avatars require this + create."""
+    await groupme_request(session, "POST", "/bots/destroy", form={"bot_id": str(bot_id)})
+
+
 async def groupme_post_bot(
     session: aiohttp.ClientSession, bot_id: str, text: str, picture_url: str | None = None
 ) -> None:
@@ -918,7 +923,15 @@ async def relay_discord_message(
         await send_to_topic(session, bridge, body, hosted)
     else:
         bot_id = bridge["bot_id"]
-        await groupme_post_bot(session, bot_id, body)
+        try:
+            await groupme_post_bot(session, bot_id, body)
+        except GroupMeError as error:
+            # GroupMe answers 404 when the bot id no longer exists (deleted, recreated,
+            # or copied from another account). Repair the bridge and post once more.
+            if error.status != 404:
+                raise
+            bot_id = await recover_bot_id(session, bridge)
+            await groupme_post_bot(session, bot_id, body)
         for image_url in hosted:
             await groupme_post_bot(session, bot_id, header, picture_url=image_url)
 
@@ -930,6 +943,31 @@ async def relay_discord_message(
         len(hosted),
         failed,
     )
+
+
+async def recover_bot_id(session: aiohttp.ClientSession, bridge: sqlite3.Row) -> str:
+    """Find or create a working bot for the bridge's group and store it."""
+    group_id = bridge["group_id"]
+    existing = await groupme_find_bot(session, group_id, callback_url())
+    bot_id = str((existing or {}).get("bot_id") or "")
+    if not bot_id:
+        created = await groupme_create_bot(
+            session, group_id, GROUPME_BOT_NAME, callback_url(), GROUPME_BOT_AVATAR_URL
+        )
+        bot_id = str(created.get("bot_id") or "")
+    if not bot_id:
+        raise GroupMeError(f"could not obtain a GroupMe bot for group {group_id}")
+    save_bridge(
+        group_id,
+        int(bridge["channel_id"]),
+        bot_id,
+        bridge["group_name"],
+        topic_id=bridge["topic_id"],
+        topic_name=bridge["topic_name"],
+        send_mode=bridge["send_mode"] or "bot",
+    )
+    log.warning("Replaced stale GroupMe bot id for group %s with %s", group_id, bot_id)
+    return bot_id
 
 
 async def host_image_for_groupme(
@@ -1005,9 +1043,11 @@ def parse_group_id(value: str) -> str:
 
 
 def callback_url() -> str:
-    if not PUBLIC_BASE_URL:
+    """Public callback URL, usable even before the tunnel starts (e.g. from scripts)."""
+    base = PUBLIC_BASE_URL or (f"https://{NGROK_DOMAIN}" if NGROK_DOMAIN else "")
+    if not base:
         return ""
-    return f"{PUBLIC_BASE_URL}{GROUPME_WEBHOOK_PATH}"
+    return f"{base.rstrip('/')}{GROUPME_WEBHOOK_PATH}"
 
 
 def find_topic(topics: list[dict], query: str) -> dict | None:
@@ -1039,6 +1079,29 @@ async def bridge_autocomplete(
     return choices[:25]
 
 
+async def topic_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Offer the topics of whichever group id is already typed in the command."""
+    if not GROUPME_ACCESS_TOKEN:
+        return []
+    group_id = parse_group_id(str(interaction.namespace.group_id or ""))
+    if not group_id.isdigit():
+        return []
+    try:
+        topics = await groupme_list_subgroups(interaction.client.groupme_session, group_id)
+    except (GroupMeError, aiohttp.ClientError):
+        return []
+    current = (current or "").casefold().lstrip("#")
+    choices = []
+    for topic in topics:
+        name = str(topic.get("topic") or topic.get("id"))
+        topic_id = str(topic.get("id"))
+        if current in name.casefold() or current in topic_id:
+            choices.append(app_commands.Choice(name=f"#{name}"[:100], value=name[:100]))
+    return choices[:25]
+
+
 async def require_manager(interaction: discord.Interaction) -> bool:
     """Bridge management is restricted to server administrators."""
     user = interaction.user
@@ -1059,6 +1122,7 @@ async def require_manager(interaction: discord.Interaction) -> bool:
     name="add",
     description="Bridge a GroupMe group, or a single topic inside it, to a Discord channel.",
 )
+@app_commands.autocomplete(topic=topic_autocomplete)
 @app_commands.describe(
     group_id="GroupMe group id (or a groupme.com join link)",
     channel="Discord text channel that mirrors the conversation",
@@ -1204,7 +1268,7 @@ async def bridge_add(
                     group_id,
                     GROUPME_BOT_NAME,
                     callback_url(),
-                    GROUPME_BOT_AVATAR_URL,
+                    await interaction.client.bot_avatar_url(),
                 )
                 bot_id = str(created.get("bot_id") or "")
                 if not bot_id:
@@ -1416,7 +1480,7 @@ async def bridge_topics(interaction: discord.Interaction, group_id: str):
     name="set-topic",
     description="Send Discord messages to a different GroupMe topic, or back to the main chat.",
 )
-@app_commands.autocomplete(group_id=bridge_autocomplete)
+@app_commands.autocomplete(group_id=bridge_autocomplete, topic=topic_autocomplete)
 @app_commands.describe(
     group_id="GroupMe group id",
     topic="Topic name or id (use 'none' to clear and post to the main chat)",
@@ -1639,6 +1703,143 @@ async def bridge_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bridge_group.command(
+    name="set-avatar",
+    description="Give the bridge's GroupMe bot the Discord bot's picture (recreates the bot).",
+)
+@app_commands.autocomplete(group_id=bridge_autocomplete)
+@app_commands.describe(
+    group_id="GroupMe group id",
+    image_url="Optional image URL; defaults to the Discord bot's avatar",
+)
+async def bridge_set_avatar(
+    interaction: discord.Interaction, group_id: str, image_url: str = ""
+):
+    if not await require_manager(interaction):
+        return
+    bridge = bridge_for_group(parse_group_id(group_id))
+    if bridge is None:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⚠️ No such bridge",
+                description=f"No bridge is registered for GroupMe group `{group_id}`.",
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return
+    if not bridge["bot_id"]:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⚠️ No GroupMe bot",
+                description=(
+                    "This bridge posts with the access token (topic bridge), so it has no bot "
+                    "avatar to set."
+                ),
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    client = interaction.client
+    session = client.groupme_session
+    try:
+        avatar = (
+            await client.host_avatar(image_url.strip())
+            if image_url.strip()
+            else await client.bot_avatar_url()
+        )
+    except (GroupMeError, aiohttp.ClientError) as error:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="❌ Avatar upload failed",
+                description=f"`{error}`",
+                color=discord.Color.red(),
+            ),
+            ephemeral=True,
+        )
+        return
+    if not avatar:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="⚠️ No avatar available",
+                description="Pass an `image_url` or set `GROUPME_BOT_AVATAR_URL`.",
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return
+
+    # GroupMe has no update endpoint, so the bot is replaced with an identical one.
+    try:
+        await groupme_destroy_bot(session, bridge["bot_id"])
+    except GroupMeError as error:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="❌ Could not remove the old bot",
+                description=f"`{error}`",
+                color=discord.Color.red(),
+            ),
+            ephemeral=True,
+        )
+        return
+
+    created: dict = {}
+    try:
+        created = await groupme_create_bot(
+            session, bridge["group_id"], GROUPME_BOT_NAME, callback_url(), avatar
+        )
+    except GroupMeError:
+        log.exception("Recreating bot %s with an avatar failed", bridge["bot_id"])
+
+    new_bot_id = str(created.get("bot_id") or "")
+    note = ""
+    if not new_bot_id:
+        try:
+            created = await groupme_create_bot(
+                session, bridge["group_id"], GROUPME_BOT_NAME, callback_url(), ""
+            )
+            new_bot_id = str(created.get("bot_id") or "")
+            note = "\nGroupMe refused the avatar, so the bot was recreated without one."
+        except GroupMeError as error:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Bot recreation failed",
+                    description=(
+                        f"The old bot was deleted and the replacement failed: `{error}`\n"
+                        "Run `/bridge set-bot` with a new bot id, or `/bridge add` again."
+                    ),
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return
+
+    save_bridge(
+        bridge["group_id"],
+        int(bridge["channel_id"]),
+        new_bot_id,
+        bridge["group_name"],
+        topic_id=bridge["topic_id"],
+        topic_name=bridge["topic_name"],
+        send_mode=bridge["send_mode"] or "bot",
+    )
+    await client.refresh_bot_names()
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="✅ Avatar updated",
+            description=(
+                f"Group `{bridge['group_id']}` now posts with bot `{new_bot_id}`.\n"
+                f"Avatar: {avatar}{note}"
+            ),
+            color=discord.Color.green(),
+        ),
+        ephemeral=True,
+    )
+
+
 @bridge_group.command(name="test", description="Send a test message in both directions.")
 @app_commands.autocomplete(group_id=bridge_autocomplete)
 @app_commands.describe(group_id="GroupMe group id to test")
@@ -1717,6 +1918,7 @@ class Bot(discord.Client):
         self.web_runner: web.AppRunner | None = None
         self.ngrok_listener = None
         self.webhooks: dict[int, discord.Webhook] = {}
+        self.bot_avatar: str | None = None
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -1858,6 +2060,40 @@ class Bot(discord.Client):
         log.info("Bot invite URL (Manage Webhooks + message permissions): %s", invite)
 
     # -- GroupMe helpers ---------------------------------------------------- #
+
+    async def host_avatar(self, url: str) -> str:
+        """Download an image URL and re-host it on GroupMe (bot avatars need i.groupme.com)."""
+        async with self.groupme_session.get(
+            url, timeout=aiohttp.ClientTimeout(total=30)
+        ) as response:
+            if response.status != 200:
+                raise GroupMeError(f"could not download {url} ({response.status})")
+            data = await read_body_limited(response, IMAGE_SOURCE_LIMIT_BYTES)
+            content_type = response.content_type or "image/png"
+        if not data:
+            raise GroupMeError(f"{url} returned an empty or oversized body")
+        return await groupme_upload_image(self.groupme_session, data, content_type)
+
+    async def bot_avatar_url(self) -> str:
+        """Avatar for newly created GroupMe bots: env override, else this bot's picture."""
+        if self.bot_avatar is not None:
+            return self.bot_avatar
+        if GROUPME_BOT_AVATAR_URL:
+            self.bot_avatar = GROUPME_BOT_AVATAR_URL
+            if "i.groupme.com" not in GROUPME_BOT_AVATAR_URL:
+                log.warning(
+                    "GROUPME_BOT_AVATAR_URL is not an i.groupme.com URL; GroupMe will ignore it"
+                )
+            return self.bot_avatar
+        if self.user is None or not GROUPME_ACCESS_TOKEN:
+            return ""
+        try:
+            self.bot_avatar = await self.host_avatar(self.user.display_avatar.with_size(256).url)
+            log.info("GroupMe bots will use the Discord avatar %s", self.bot_avatar)
+        except (GroupMeError, aiohttp.ClientError):
+            log.exception("Could not prepare a GroupMe bot avatar")
+            self.bot_avatar = ""
+        return self.bot_avatar
 
     async def refresh_bot_names(self) -> None:
         """Cache bot names so bot-authored messages are never mirrored back."""

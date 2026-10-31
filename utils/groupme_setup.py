@@ -27,7 +27,7 @@ load_dotenv(ROOT / ".env")
 
 API = os.environ.get("GROUPME_API_BASE", "https://api.groupme.com/v3").rstrip("/")
 TOKEN = os.environ.get("GROUPME_ACCESS_TOKEN", "").strip()
-DEFAULT_BOT_NAME = "Catbird Bridge"
+DEFAULT_BOT_NAME = "Discord"
 
 
 def headers() -> dict[str, str]:

@@ -1,20 +1,99 @@
 # Project guidance
 
-- `bot.py` is a bidirectional GroupMe <-> Discord bridge. Bridges are strictly one-to-one: each GroupMe conversation (a group's main chat, or one of its topics) maps to exactly one Discord destination, which is a text channel or a forum post/thread (`bridges.conversation_id` is the primary key and `bridges.channel_id` is unique). `/bridge add` resolves the destination from where the command runs, so it takes no channel argument.
-- A GroupMe topic is a subgroup: detect it with `GET /groups/{id}/subgroups` (`id`, `parent_id`, `topic`). A topic bridge mirrors only that topic, stores `conversation_type='topic'` and `send_mode='user'`, is polled every cycle (subgroups never fire bot callbacks), and posts with `POST /groups/{topic_id}/messages`. Topic bridges need no GroupMe bot at all. A group can have a main-chat bridge and a topic bridge at the same time, on different destinations.
-- Forum posts and threads have no webhook of their own: `webhook_channel_id()` returns the parent, and `send_via_webhook()` passes `thread=` when `target_kind='thread'`. `ensure_target_open()` unarchives an archived post before posting. Running `/bridge add` on a forum channel itself creates the post (`create_thread`) and bridges that.
-- Discord -> GroupMe uses the group's GroupMe bot (`/bots/post`) for group bridges and `send_as_user()` (access token plus `image.groupme.com` uploads) for topic bridges and for groups that refuse bot creation (`POST /bots` answers `401` for them, even in GroupMe's UI — keep that fallback, it is the only way to bridge such a group). `/bridge add` creates the group bot automatically (`groupme_create_bot`, `GROUPME_BOT_NAME`) and reuses an existing one when GroupMe answers "callback url ... already registered for group". `groupme_create_bot_with_fallback` retries without the avatar when GroupMe refuses it, and `ensure_group_bot` falls back to any bot the account lists for the group; its note must stay in the user-facing failure reply, because hiding GroupMe's reason makes bot-creation failures undiagnosable. Bot avatars must be `i.groupme.com` URLs (anything else is dropped), so they are re-hosted from the Discord avatar or `GROUPME_BOT_AVATAR_URL`; GroupMe has no bot update endpoint, so `/bridge set-avatar` deletes and recreates the bot. GroupMe -> Discord uses a per-channel webhook so sender names and avatars survive. Keep both idempotency guards: Discord skips `author.bot` and `webhook_id`, GroupMe skips `system`, non-`user` `sender_type`, missing `user_id`, and cached bot names (`BOT_NAMES`); token posts are also recorded in `RECENT_OUTBOUND`/`message_links` so they never echo back.
-- Discord text is rewritten before it reaches GroupMe: every message starts with `Nickname:` (picture-only bot posts include it too), user/role mentions become `@Name`, channels become `#name`, and emoji are stripped. Do not reintroduce Discord markup. GroupMe -> Discord relays the text untouched: because each destination mirrors exactly one conversation, no `#topic:` prefix or channel label is added.
-- Images sent to GroupMe run through `compress_image` (Pillow): downscale to `IMAGE_MAX_DIMENSION`, re-encode as JPEG at `IMAGE_JPEG_QUALITY`, and lower quality until under `IMAGE_UPLOAD_LIMIT_BYTES`, then upload to `image.groupme.com` for both bot and topic bridges. Animated GIFs pass through untouched. GroupMe rejects non-`i.groupme.com` URLs (`invalid origin`), so never post a raw Discord CDN URL as `picture_url`; without an access token images are skipped and the message notes how many were dropped. Keep `read_body_limited` for downloads; `StreamReader.read(n)` truncates.
-- Every `/bridge` command is administrator-only (`require_manager` plus the group's `default_permissions`); keep both checks in place when adding commands.
-- `sync_commands()` publishes guild-scoped commands when `DISCORD_GUILD_ID` is set, and calls `purge_global_commands()` first: a global command set from a run without a guild id survives every guild resync, shows up twice in Discord, and breaks autocomplete with `CommandSignatureMismatch`. Keep that purge.
-- GroupMe's API has no edit or delete endpoint, so message edits are not mirrored in either direction. Do not add code that pretends a GroupMe message can be mutated in place.
-- `/bots/post` returns 404 for an unknown bot id; `recover_bot_id` repairs the bridge (find or create the group's bot, save the new id) and the relay retries once. `callback_url()` falls back to `NGROK_DOMAIN` so scripts that run outside the bot process can still create bots with a valid callback.
-- Keep the single-file structure. Editing a bridge or its schema must remain safe for live state: `SCHEMA_VERSION` drops the tables on change, so bump it only with a migration plan.
-- Read configuration from environment variables. Never commit credentials; update `.env.example` when configuration changes.
-- Webhook mode can expose the aiohttp callback server through the `ngrok` SDK (`NGROK_ENABLED`, `NGROK_DOMAIN`, `NGROK_AUTHTOKEN`). The tunnel URL replaces `PUBLIC_BASE_URL` at startup and must stay in sync with what `/bridge add` prints.
-- Preserve GroupMe request pacing/retries in `groupme_request` (429 + 5xx backoff, 304 means "no new messages").
-- Dependencies belong in `requirements.txt`. Avoid adding a dependency for behavior the standard library already handles.
-- Reusable scripts live in `utils/` (setup, bridge creation, bot maintenance, env sync, payload inspection, slash-command audit) and checks in `tests/`. For Python edits run `python -m py_compile bot.py utils\*.py tests\*.py`, then `python tests\smoke.py` and `python tests\integration.py` (the integration test runs against a local fake GroupMe API on port 8731 and a temp database).
-- Deployment lives in `deploy/`: `catbird-bot.service` runs `bot.py` from `/opt/catbirdBot` with `/opt/catbirdBot/.venv/bin/python` as the `catbird` user. Keep `WorkingDirectory` in sync with the paths in the README, and remember `deploy/` must stay tracked by git.
-- `requirements.txt` pins ngrok by interpreter: `ngrok>=1.4,<1.5` below Python 3.12 and `ngrok>=1.7` at 3.12+. Both SDKs support the same calls used in `start_tunnel`; do not raise the floor without checking `requires_python` on PyPI.
+`bot.py` is a single-file bidirectional GroupMe <-> Discord bridge. Everything below is
+a constraint that has already bitten us once.
+
+## Model
+
+- **Strictly one-to-one.** Each GroupMe conversation (a group's main chat, or one of its
+  topics) maps to exactly one Discord destination, and each destination carries exactly
+  one bridge: `bridges.conversation_id` is the primary key and `bridges.channel_id` is
+  unique. A group may have a main-chat bridge and a topic bridge at once, on different
+  destinations.
+- **Destination comes from context.** `/bridge add` uses the channel/post it runs in: a
+  text channel, a forum channel (`forum.create_thread(...)` then bridge the post), or an
+  existing post/thread. Every other `/bridge` command except `topics` acts on the current
+  channel/post, so none take a Discord channel argument.
+- **`SCHEMA_VERSION` rebuilds the tables** when it changes (`init_db` drops and
+  recreates them). There is no migration path; bump it only when losing bridges is
+  intended. Keep the single-file structure.
+
+## GroupMe specifics
+
+- **Topics are subgroups**: `GET /groups/{id}/subgroups` → `id`, `parent_id`, `topic`.
+  They have no bots and never fire callbacks. A topic bridge stores
+  `conversation_type='topic'` and `send_mode='user'`, is polled every cycle, and posts
+  with `POST /groups/{topic_id}/messages`.
+- **Posting**: `send_mode='bot'` → `/bots/post`; `send_mode='user'` → `send_as_user()`
+  (access token plus `image.groupme.com` uploads), used for topics *and* for groups that
+  refuse bots.
+- **Groups can forbid bots**: `POST /bots` answers `401 unauthorized` for them, even in
+  GroupMe's own UI. `/bridge add` must keep falling back to `send_mode='user'` plus
+  polling — it is the only way to bridge such a group.
+- **Bot creation** (`ensure_group_bot`): create automatically with `GROUPME_BOT_NAME`.
+  GroupMe answers `400 ... already registered for group` when the callback URL is taken,
+  so reuse the bot the account lists. `groupme_create_bot_with_fallback` retries without
+  the avatar when GroupMe refuses it. The returned note carries GroupMe's own reason and
+  **must stay in the user-facing failure reply**; hiding it made failures undiagnosable.
+- **Avatars** must be `i.groupme.com` URLs; anything else is dropped. Upload a fresh copy
+  per bot (`fresh_bot_avatar`) and never reuse one — GroupMe deletes the hosted image when
+  its bot is destroyed. There is no bot update endpoint, so `/bridge set-avatar` deletes
+  and recreates the bot.
+- **`/bots/post` returns 404** for an unknown bot id: `recover_bot_id` finds or creates
+  the group's bot, stores the id, and the relay retries once. `callback_url()` falls back
+  to `NGROK_DOMAIN` so scripts outside the bot process still get a valid callback.
+- **`groupme_request`** owns pacing and retries (429 + 5xx backoff, `304` means no new
+  messages). Do not bypass it.
+- **No edits or deletes** exist in the API. Never add code that pretends otherwise.
+
+## Discord specifics
+
+- **Forum posts and threads have no webhook of their own**: `webhook_channel_id()` returns
+  the parent, `send_via_webhook()` passes `thread=` when `target_kind='thread'`, and
+  `ensure_target_open()` unarchives an archived post before posting.
+- **Keep both idempotency guards**: Discord skips `author.bot` and `webhook_id`; GroupMe
+  skips `system`, non-`user` `sender_type`, missing `user_id`, and cached bot names
+  (`BOT_NAMES`). Token posts are recorded in `RECENT_OUTBOUND`/`message_links` so they
+  never echo back.
+- **Text rendering**: Discord → GroupMe starts every message with `Nickname:` (including
+  picture-only posts), turns user/role mentions into `@Name` and channels into `#name`, and
+  strips emoji. Do not reintroduce Discord markup. GroupMe → Discord relays the text
+  untouched — no `#topic:` prefix or channel label, because each destination mirrors one
+  conversation.
+- **Commands are administrator-only twice over**: `bridge_group`'s
+  `default_permissions=administrator` plus `require_manager`. Keep both when adding
+  commands.
+- **`sync_commands()`** publishes guild-scoped commands when `DISCORD_GUILD_ID` is set and
+  calls `purge_global_commands()` first. A global set from a run without a guild id
+  survives every guild resync, shows up twice, and breaks autocomplete with
+  `CommandSignatureMismatch`. Keep that purge.
+
+## Images
+
+`compress_image` (Pillow) downscales to `IMAGE_MAX_DIMENSION`, re-encodes as JPEG at
+`IMAGE_JPEG_QUALITY`, and lowers quality until under `IMAGE_UPLOAD_LIMIT_BYTES`, then
+uploads to `image.groupme.com`. Animated GIFs pass through untouched. GroupMe rejects
+non-`i.groupme.com` URLs (`invalid origin`), so never post a raw Discord CDN URL as
+`picture_url`; without an access token images are skipped and the message says how many
+were dropped. Use `read_body_limited` for downloads — `StreamReader.read(n)` truncates.
+
+## Config and ops
+
+- Configuration comes from environment variables. Never commit credentials; keep
+  `.env.example` in step with new settings. `.env` is read by `python-dotenv`, not by
+  systemd.
+- Webhook mode can expose the aiohttp callback server through the `ngrok` SDK
+  (`NGROK_ENABLED`, `NGROK_DOMAIN`, `NGROK_AUTHTOKEN`). The tunnel URL replaces
+  `PUBLIC_BASE_URL` at startup and must match what `/bridge add` prints.
+- `requirements.txt` pins ngrok by interpreter (`>=1.4,<1.5` below 3.12, `>=1.7` above);
+  both SDKs support the calls used in `start_tunnel`. Check `requires_python` on PyPI
+  before raising the floor. Avoid new dependencies for what the stdlib already does.
+- `deploy/catbird-bot.service` runs `bot.py` from `/opt/catbirdBot` as `catbird`; keep
+  `WorkingDirectory` in sync with the README and keep `deploy/` tracked by git.
+
+## Working on it
+
+- Edits go in `bot.py`, reusable scripts in `utils/`, checks in `tests/`.
+- After Python changes run `python -m py_compile bot.py utils\*.py tests\*.py`, then
+  `python tests\smoke.py` and `python tests\integration.py` (the last one runs a fake
+  GroupMe API on port 8731 with a temporary database).

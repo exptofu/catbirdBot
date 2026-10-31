@@ -1,19 +1,21 @@
 """Catbird: a bidirectional GroupMe <-> Discord bridge.
 
-Each bridged GroupMe conversation is mirrored into exactly one Discord channel
-and vice versa. Bridges are created, changed, and removed with the `/bridge`
-slash command and persisted in SQLite.
+Each bridged GroupMe conversation is mirrored into exactly one Discord destination
+and vice versa. A conversation is either a group's main chat or one of its topics
+(subgroups), and the destination is either a text channel or a forum post/thread.
+Bridges are created, changed, and removed with the `/bridge` slash command and
+persisted in SQLite.
 
 Message flow:
-  Discord -> GroupMe  group bridges post through the group's GroupMe bot;
-                      topic bridges post into the topic (subgroup) with the
-                      access token because GroupMe does not allow bots there.
+  Discord -> GroupMe  main-chat bridges post through the group's GroupMe bot;
+                      topic bridges, and groups that refuse bot creation, post
+                      with the access token (`send_as_user`).
   GroupMe -> Discord  messages are posted through a channel webhook so the
-                      original sender name and avatar are preserved.
+                      original sender name and avatar are preserved. Main chats
+                      arrive by bot callback or polling; topics are always polled.
 
-A GroupMe "topic" is a subgroup with its own message stream. A topic bridge
-relays the group's main chat *and* the mapped topic into one Discord channel,
-while Discord messages go to the topic.
+Every `/bridge` command except `add` and `topics` acts on the channel or post it
+was run in, so no command takes a Discord channel argument.
 
 Edits are not mirrored: GroupMe's public API has no edit or delete endpoint.
 """

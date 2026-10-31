@@ -1,6 +1,6 @@
 # Catbird Bot
 
-A two-way bridge between GroupMe groups and Discord channels. Any number of GroupMe groups can be paired with any number of channels in a single Discord server, and the pairings are managed with a `/bridge` slash command.
+A two-way bridge between GroupMe and Discord. Each GroupMe conversation — a group's main chat or one of its topics — is paired with one Discord destination, either a text channel or a forum post, in a single Discord server. Pairings are managed with the `/bridge` slash command.
 
 ## Features
 
@@ -10,7 +10,7 @@ A two-way bridge between GroupMe groups and Discord channels. Any number of Grou
 - **Both directions**: main-chat bridges post with a GroupMe bot; topic bridges post with the access token; GroupMe messages are posted through a per-channel Discord webhook so the original name and avatar are preserved.
 - **No bot required**: when a group refuses bot creation (GroupMe answers `401` for that group, even in its own UI), the bridge falls back to posting with `GROUPME_ACCESS_TOKEN` and polls the group every `GROUPME_POLL_SECONDS` instead of relying on callbacks.
 - **Photos**: GroupMe images are downloaded and re-uploaded as Discord attachments; Discord images are downloaded, compressed, and re-hosted on GroupMe's image service for both group and topic bridges. GroupMe rejects non-GroupMe image URLs (`invalid origin`), so an image that cannot be re-hosted is skipped and the message notes how many were dropped.
-- **No bot echo**: bot messages are skipped on both sides, and topic posts are tracked so they are not mirrored back.
+- **No bot echo**: bot messages are skipped on both sides, and token posts are tracked so they are not mirrored back.
 
 ## Run
 
@@ -67,7 +67,7 @@ The unit uses `KillSignal=SIGINT` because `discord.py` shuts down on SIGINT thro
    python utils/groupme_setup.py create-bot --group-id 12345678 --callback-url https://example.com/groupme/callback
    ```
 
-   The command prints the `bot_id`, which can be passed to `/bridge add` instead of letting it create one.
+  The command prints the `bot_id`, which can be passed to `/bridge add` instead of letting it create one. Some groups do not allow bots at all (`POST /bots` returns `401` for them, even in GroupMe's own UI); such groups are still bridgeable, because the bridge falls back to posting with the access token.
 3. Choose a transport:
 
    | `GROUPME_MODE` | How GroupMe messages arrive | Requirements |
@@ -119,8 +119,8 @@ With `DISCORD_GUILD_ID` set, the bot also deletes any **globally** registered co
 
 A GroupMe **topic** is a subgroup with its own message stream, its own id, and no bot support. Topics are bridged one-to-one, independently of the group's main chat:
 
-- **GroupMe → Discord**: only the mapped conversation relays, never both. A topic bridge polls its own topic; a main-chat bridge gets bot callbacks, or polls in `GROUPME_MODE=poll`.
-- **Discord → GroupMe**: a main-chat bridge posts with the group's bot; a topic bridge posts into the topic with `GROUPME_ACCESS_TOKEN`, so it appears as the authenticated GroupMe account. Images are uploaded to `image.groupme.com` first so they render inline.
+- **GroupMe → Discord**: only the mapped conversation relays, never both. A topic bridge polls its own topic; a main-chat bridge gets bot callbacks, or polls when `GROUPME_MODE=poll` or when the bridge has no bot.
+- **Discord → GroupMe**: a main-chat bridge posts with the group's bot (or with the access token if the group forbids bots); a topic bridge always posts with `GROUPME_ACCESS_TOKEN`, so it appears as the authenticated GroupMe account. Images are uploaded to `image.groupme.com` first so they render inline.
 
 One group can therefore have two bridges at the same time — the main chat in one channel and `#cobb` in a forum post — but each conversation has exactly one Discord destination and each destination carries exactly one bridge. `bridges.conversation_id` is the primary key, `bridges.channel_id` is unique, and `/bridge add` refuses a conversation or a destination that is already taken.
 
@@ -162,8 +162,8 @@ Only two things are tied to a GroupMe account:
    python utils/bot_admin.py ensure --group <group_id>   # per bridged group
    ```
 
-   Re-running `/bridge add group_id channel [topic]` for the same group and channel also updates the bridge, but it creates a fresh Discord webhook each time, so `bot_admin.py ensure` is the tidier route.
-7. **Restart and verify.** `refresh_bot_names()` rebuilds `BOT_NAMES` from the new token at startup. Run `/bridge test group_id` and watch `journalctl -u catbird-bot -f` for `404`/`403` responses.
+   Re-running `/bridge add group_id:<id>` in the channel also updates the bridge, but it creates a fresh Discord webhook each time, so `bot_admin.py ensure` is the tidier route.
+7. **Restart and verify.** `refresh_bot_names()` rebuilds `BOT_NAMES` from the new token at startup. Run `/bridge test` in each bridged channel/post and watch `journalctl -u catbird-bot -f` for `404`/`403` responses.
 
 Visible effects: topic bridges (`send_mode='user'`) now post as the new account, including its name and avatar; group bridges still post through the bot, so only the bot's owning account changes. Keep the new account in the groups permanently — removing it breaks polling, topic relay, and image upload even though the bots keep firing callbacks. The old account can leave the groups after the new bots post successfully, but keep it alive until then, because its token is the only way to delete its bots.
 
@@ -180,7 +180,7 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 - Forum posts and threads have no webhook of their own: the bridge creates the webhook on the parent forum/text channel and passes the thread id when posting. An archived post is unarchived before the message is sent.
 - GroupMe messages are mirrored with `AllowedMentions.none()`, so `@everyone` in GroupMe cannot ping Discord.
 - Bot filtering: Discord messages with `author.bot` or a `webhook_id` are skipped (the bridge's own webhooks included). GroupMe messages with `system: true`, `sender_type` other than `user`, no `user_id`, or a name matching a bot owned by the access token are skipped, so give each bridge bot a distinctive name.
-- Topic posts are made with the access token, so they come back from the API as ordinary user messages; the bridge stores their ids and never mirrors them back into Discord.
+- Posts made with the access token (topic bridges, and groups that refuse bots) come back from the API as ordinary user messages; the bridge stores their ids and never mirrors them back into Discord.
 - GroupMe answers `404` on `/bots/post` when a bot id no longer exists (deleted, recreated, or copied from another account). The bridge treats that as a stale mapping: it looks up the group's bot (creating one with the configured name, avatar, and callback if needed), saves the new id, and retries the post once.
 - The poller makes one request per polled conversation per cycle (topics always, main chats only in `poll` mode or when the bridge has no bot). GroupMe rate limits per token, so raise `GROUPME_POLL_SECONDS` when bridging many conversations.
 - The first poll for a conversation baselines at its newest message; history is never replayed.
@@ -195,13 +195,13 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 | --- | --- |
 | `bot.py` | The bridge: Discord client, GroupMe API client, relays, and slash commands. |
 | `utils/groupme_setup.py` | Lists GroupMe groups/bots, creates or updates a bot, sets callbacks. |
-| `utils/bridge_setup.py` | Creates a bridge without slash commands (webhook, bot, topic, baselines). |
+| `utils/bridge_setup.py` | Creates a bridge without slash commands (`--channel`, or `--thread <post> --parent <forum>`); bot, topic, and baselines handled. |
 | `utils/bot_admin.py` | Bot maintenance: `list` (with avatar reachability), `ensure`, `repair`, `resync-avatars`. |
 | `utils/sync_env.py` | Rebuilds `.env` from `.env.example` while preserving existing values. |
 | `utils/inspect_payloads.py` | Summarizes captured GroupMe callbacks (`groupme_payloads.jsonl`). |
 | `utils/check_commands.py` | Compares the slash commands registered in Discord with the ones in `bot.py`; `--fix` deletes a stale global command set. |
-| `tests/smoke.py` | Fast checks for DB helpers, rendering, and topic matching. |
-| `tests/integration.py` | Offline end-to-end run against a fake GroupMe API (relays, images, bot recovery). |
+| `tests/smoke.py` | Fast checks for DB helpers and bridge constraints, rendering, and topic matching. |
+| `tests/integration.py` | Offline end-to-end run against a fake GroupMe API (relays, images, bot creation fallbacks, token posting). |
 | `deploy/catbird-bot.service` | systemd unit that runs the bot from `/opt/catbirdBot` as the `catbird` user. |
 | `catbird.db` | SQLite store for bridges, poll cursors, and message links. Safe to delete only when every bridge can be recreated. |
 

@@ -103,7 +103,7 @@ async def bots_destroy(request):
 
 async def message_post(request):
     body = await request.json()
-    POSTED_MESSAGE.append(body["message"])
+    POSTED_MESSAGE.append({"group_id": request.match_info["group_id"], **body["message"]})
     return web.json_response({"response": {"message": {"id": "9001", **body["message"]}}})
 
 
@@ -376,6 +376,27 @@ async def main():
         assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
         assert max(UPLOADS[0]["dims"]) <= 2048, UPLOADS[0]
         assert "9001" in bot.RECENT_OUTBOUND
+
+        # a group that refuses bots posts into the main chat with the access token,
+        # and is polled because there is no bot to receive callbacks
+        bot.save_bridge(
+            "G3",
+            888,
+            "",
+            "No Bots",
+            conversation_type="group",
+            group_name="No Bots",
+            send_mode="user",
+        )
+        assert "G3" in dict(bot.poll_targets()), bot.poll_targets()
+        assert bot.bridge_for_conversation("G3")["send_mode"] == "user"
+        POSTED_MESSAGE.clear()
+        UPLOADS.clear()
+        await bot.relay_discord_message(session, Message(), bot.bridge_for_conversation("G3"))
+        assert len(POSTED_MESSAGE) == 1, POSTED_MESSAGE
+        assert POSTED_MESSAGE[0]["group_id"] == "G3", POSTED_MESSAGE[0]
+        assert POSTED_MESSAGE[0]["text"].startswith("Ann: hello group"), POSTED_MESSAGE[0]
+        assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
 
         small = bot.compress_image(b"not-an-image", "image/png", "small.png")
         assert small == (b"not-an-image", "image/png"), small

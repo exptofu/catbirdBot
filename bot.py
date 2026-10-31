@@ -1090,7 +1090,7 @@ async def relay_discord_message(
         body = truncate(body)
 
     if bridge["send_mode"] == "user":
-        await send_to_topic(session, bridge, body, hosted)
+        await send_as_user(session, bridge, body, hosted)
     else:
         bot_id = bridge["bot_id"]
         try:
@@ -1227,23 +1227,26 @@ async def fresh_bot_avatar(session: aiohttp.ClientSession, client=None) -> str:
     return ""
 
 
-async def send_to_topic(
+async def send_as_user(
     session: aiohttp.ClientSession,
     bridge: sqlite3.Row,
     body: str,
     image_urls: list[str],
 ) -> None:
-    """Post into a topic (subgroup); GroupMe only allows this with the user token."""
+    """Post with the access token instead of a bot.
+
+    Used for topics (which cannot host bots) and for groups that refuse bot creation.
+    """
     if not GROUPME_ACCESS_TOKEN:
         raise GroupMeError(
-            "GROUPME_ACCESS_TOKEN is required to post into a GroupMe topic"
+            "GROUPME_ACCESS_TOKEN is required to post as a GroupMe user"
         )
     attachments = [{"type": "image", "url": url} for url in image_urls]
 
     conversation_id = outbound_conversation_id(bridge)
     created = await groupme_post_message(session, conversation_id, body, attachments)
     if created and created.get("id"):
-        # Remember the id so the poller does not mirror our own topic post back to Discord.
+        # Remember the id so the poller does not mirror our own post back to Discord.
         message_id = str(created["id"])
         RECENT_OUTBOUND[message_id] = time.monotonic()
         add_link(
@@ -1610,13 +1613,26 @@ async def bridge_add(
                         "posting may fail with 404."
                     )
         else:
-            # Main-chat bridges post through a GroupMe bot, so one is required here.
+            # Main-chat bridges post through a GroupMe bot when one is available.
             resolved, note = await ensure_group_bot(
                 session, group_id, await fresh_bot_avatar(session, interaction.client)
             )
             if note:
                 warnings.append(note)
-            if not resolved:
+            if resolved:
+                bot_id = resolved
+            elif GROUPME_ACCESS_TOKEN:
+                # Some groups refuse bots entirely (GroupMe answers 401 for that group even
+                # in its own UI). The access token can still post into the main chat, so the
+                # bridge keeps working both ways: the inbound side is polled instead.
+                send_mode = "user"
+                warnings.append(
+                    "GroupMe would not create a bot for this group, so Discord messages are "
+                    "posted with `GROUPME_ACCESS_TOKEN` and appear as your GroupMe account. "
+                    "GroupMe messages are polled every "
+                    f"{GROUPME_POLL_SECONDS}s instead of arriving by callback."
+                )
+            else:
                 hint = ""
                 lowered = note.lower()
                 if "401" in lowered or "unauthor" in lowered:
@@ -1653,7 +1669,6 @@ async def bridge_add(
                     ephemeral=True,
                 )
                 return
-            bot_id = resolved
     if bot_id and not callback_url() and GROUPME_MODE == "webhook":
         warnings.append(
             "The bot has no callback URL; set `GROUPME_PUBLIC_URL` or `NGROK_DOMAIN` so "
@@ -1892,11 +1907,12 @@ async def bridge_set_topic(interaction: discord.Interaction, topic: str):
             return
         bot_id = bridge["bot_id"]
         if not bot_id:
-            # The main chat is posted through a GroupMe bot, so make sure one exists.
+            # The main chat is normally posted through a GroupMe bot, so make sure one
+            # exists; a group that refuses bots falls back to posting with the token.
             bot_id, note = await ensure_group_bot(
                 session, group_id, await fresh_bot_avatar(session, interaction.client)
             )
-            if not bot_id:
+            if not bot_id and not GROUPME_ACCESS_TOKEN:
                 await interaction.followup.send(
                     embed=discord.Embed(
                         title="❌ No GroupMe bot",
@@ -1909,24 +1925,27 @@ async def bridge_set_topic(interaction: discord.Interaction, topic: str):
                     ephemeral=True,
                 )
                 return
+        send_mode = "bot" if bot_id else "user"
         update_bridge_conversation(
             bridge["conversation_id"],
             group_id,
             "group",
             group_name or group_id,
-            "bot",
+            send_mode,
             bot_id=bot_id,
         )
         group = await groupme_get_group(session, group_id)
         last = ((group or {}).get("messages") or {}).get("last_message_id")
         if last:
             set_last_seen(group_id, str(last))
+        via = "" if bot_id else " Messages are posted with `GROUPME_ACCESS_TOKEN`."
         await interaction.followup.send(
             embed=discord.Embed(
                 title="✅ Now mirroring the main chat",
                 description=(
                     f"<#{destination}> now mirrors the main chat of "
-                    f"**{group_name or group_id}**. Topic messages are no longer relayed here."
+                    f"**{group_name or group_id}**. Topic messages are no longer relayed "
+                    f"here.{via}"
                 ),
                 color=discord.Color.green(),
             ),

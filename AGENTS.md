@@ -1,0 +1,11 @@
+# Project guidance
+
+- `bot.py` is a bidirectional GroupMe <-> Discord bridge. Each GroupMe group maps to exactly one Discord text channel (`bridges` table, created with `/bridge add`). GroupMe messages arrive by polling (`GROUPME_MODE=poll`) or bot callbacks (`GROUPME_MODE=webhook`); both paths funnel through `Bot.process_groupme_message`.
+- Discord -> GroupMe uses the group's GroupMe bot (`/bots/post`); GroupMe -> Discord uses a per-channel webhook so sender names and avatars survive. Keep both idempotency guards: Discord skips `author.bot` and `webhook_id`, GroupMe skips `system`, non-`user` `sender_type`, missing `user_id`, and cached bot names (`BOT_NAMES`).
+- GroupMe's API has no edit or delete endpoint, so message edits are not mirrored in either direction. Do not add code that pretends a GroupMe message can be mutated in place.
+- Keep the single-file structure. Editing a bridge or its schema must remain safe for live state: `SCHEMA_VERSION` drops the tables on change, so bump it only with a migration plan.
+- Read configuration from environment variables. Never commit credentials; update `.env.example` when configuration changes.
+- Webhook mode can expose the aiohttp callback server through the `ngrok` SDK (`NGROK_ENABLED`, `NGROK_DOMAIN`, `NGROK_AUTHTOKEN`). The tunnel URL replaces `PUBLIC_BASE_URL` at startup and must stay in sync with what `/bridge add` prints.
+- Preserve GroupMe request pacing/retries in `groupme_request` (429 + 5xx backoff, 304 means "no new messages").
+- Dependencies belong in `requirements.txt`. Avoid adding a dependency for behavior the standard library already handles.
+- There is no test suite yet. For Python edits, run `python -m py_compile bot.py utils/groupme_setup.py` and add or run a focused behavior check when practical.

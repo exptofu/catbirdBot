@@ -1,0 +1,8 @@
+.venv/
+.env
+*.db
+__pycache__/
+.cache/
+groupme_payloads.jsonl
+bot.out.log
+bot.err.log

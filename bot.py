@@ -863,6 +863,17 @@ def bridged_channel_id(message: discord.Message) -> int:
     return channel.id
 
 
+def groupme_content_for_discord(
+    bridge: sqlite3.Row, conversation_id: str, text: str
+) -> str:
+    """Prefix topic messages with #topic so one channel can carry main chat and topic."""
+    topic_id = bridge["topic_id"] or ""
+    if topic_id and str(conversation_id) == str(topic_id):
+        label = f"#{bridge['topic_name'] or topic_id}"
+        return f"{label} {text}".strip()
+    return text
+
+
 async def relay_discord_message(
     session: aiohttp.ClientSession, message: discord.Message, bridge: sqlite3.Row
 ) -> None:
@@ -871,10 +882,14 @@ async def relay_discord_message(
     images = [a for a in message.attachments if is_image_attachment(a)]
     links = [a.url for a in message.attachments if not is_image_attachment(a)]
 
-    body = f"{name}: {text}".rstrip()
+    # The nickname always leads the message so GroupMe members see who typed it,
+    # including on picture-only posts (the bot posts those separately).
+    header = f"{name}:"
     quote = quoted_reply(message)
     if quote:
-        body = f"{quote}{body}"
+        body = f"{header}\n{quote}{text}".rstrip()
+    else:
+        body = f"{header} {text}".rstrip()
     if links:
         body = f"{body}\n" + "\n".join(links)
     if len(images) > MAX_GROUPME_IMAGES:
@@ -905,7 +920,7 @@ async def relay_discord_message(
         bot_id = bridge["bot_id"]
         await groupme_post_bot(session, bot_id, body)
         for image_url in hosted:
-            await groupme_post_bot(session, bot_id, "", picture_url=image_url)
+            await groupme_post_bot(session, bot_id, header, picture_url=image_url)
 
     log.info(
         "Relayed Discord message %s from #%s to GroupMe conversation %s (%d image(s), %d failed)",
@@ -1327,7 +1342,8 @@ async def bridge_add(
     if topic_row:
         description += (
             "\nThe group's main chat and this topic are both relayed here; "
-            "Discord messages are posted into the topic."
+            "Discord messages are posted into the topic. GroupMe messages from the "
+            f"topic arrive prefixed with `#{topic_name or topic_id}`."
         )
     if moved_from:
         description += f"\nThe bridge moved from <#{moved_from}>."
@@ -1935,6 +1951,7 @@ class Bot(discord.Client):
         image_urls = groupme_image_urls(message)
         if not text and not image_urls:
             return
+        text = groupme_content_for_discord(bridge, group_id, text)
 
         username = sanitize_webhook_name(message.get("name") or "GroupMe user")
         avatar_url = message.get("avatar_url") or None

@@ -61,6 +61,8 @@ python bot.py
 
    The tunnel URL is logged on startup and used by `/bridge add` to print the callback URL to paste into the GroupMe bot settings. Leave `NGROK_DOMAIN` empty to get a new random URL each run, and set `GROUPME_PUBLIC_URL` instead if you front the port with your own proxy.
 
+   `requirements.txt` pins ngrok by Python version: 1.5+ requires Python ≥ 3.12, so Python 3.10/3.11 gets `ngrok 1.4.x` (verified against the same `forward`/`domain`/`close` calls). If ngrok cannot be installed at all (restricted index, no egress), set `NGROK_ENABLED=false` and expose the port yourself with `GROUPME_PUBLIC_URL`.
+
 
 ## Slash commands
 

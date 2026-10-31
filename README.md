@@ -7,7 +7,7 @@ A two-way bridge between GroupMe groups and Discord channels. Any number of Grou
 - **Many-to-many bridges** in one Discord server, stored in SQLite (`catbird.db`).
 - **Topic bridges**: a GroupMe group with several topics can relay its main chat *and* one chosen topic into a single channel; Discord messages are posted into that topic.
 - **Both directions**: group bridges post with a GroupMe bot; topic bridges post with the access token; GroupMe messages are posted through a per-channel Discord webhook so the original name and avatar are preserved.
-- **Photos**: GroupMe images are downloaded and re-uploaded as Discord attachments; Discord images are re-hosted through GroupMe's image service (topic bridges) or handed to the group bot as `picture_url`.
+- **Photos**: GroupMe images are downloaded and re-uploaded as Discord attachments; Discord images are downloaded, compressed, and re-hosted on GroupMe's image service for both group and topic bridges. GroupMe rejects non-GroupMe image URLs (`invalid origin`), so an image that cannot be re-hosted is skipped and the message notes how many were dropped.
 - **No bot echo**: bot messages are skipped on both sides, and topic posts are tracked so they are not mirrored back.
 
 ## Run
@@ -103,7 +103,8 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 - Topic posts are made with the access token, so they come back from the API as ordinary user messages; the bridge stores their ids and never mirrors them back into Discord.
 - The poller makes one request per polled conversation per cycle (topics always, groups only in `poll` mode). GroupMe rate limits per token, so raise `GROUPME_POLL_SECONDS` when bridging many conversations.
 - The first poll for a conversation baselines at its newest message; history is never replayed.
-- Images larger than 8 MiB are skipped rather than uploaded.
+- Every image sent to GroupMe is compressed: downscaled to `IMAGE_MAX_DIMENSION` (default 2048 px) and re-encoded as JPEG at `IMAGE_JPEG_QUALITY` (default 85), lowering quality until it fits `IMAGE_UPLOAD_LIMIT_BYTES` (default 8 MiB), then re-hosted on `image.groupme.com`. Animated GIFs are kept untouched (re-encoding would drop frames) and are skipped if they exceed the budget. Originals above `IMAGE_SOURCE_LIMIT_BYTES` (32 MiB) are dropped.
+- GroupMe validates the `picture_url` origin: a Discord CDN link or any other non-`i.groupme.com` host returns `400 ... has invalid origin`. That is why images are always downloaded and re-hosted rather than passed through, and why `GROUPME_ACCESS_TOKEN` is effectively required for image relay.
 
 ## Files
 

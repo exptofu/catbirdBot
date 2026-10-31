@@ -35,7 +35,11 @@ from aiohttp import web
 from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
-GROUPME_IMAGE_API = os.environ.get("GROUPME_IMAGE_API", "https://image.groupme.com").rstrip("/")
+
+try:  # optional: shrink oversized images before they reach GroupMe
+    from PIL import Image
+except ImportError:  # pragma: no cover - Pillow ships in requirements.txt
+    Image = None
 
 load_dotenv()
 
@@ -43,6 +47,7 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 GROUPME_ACCESS_TOKEN = os.environ.get("GROUPME_ACCESS_TOKEN", "").strip()
 GROUPME_MODE = (os.environ.get("GROUPME_MODE", "poll").strip().lower() or "poll")
 GROUPME_API_BASE = os.environ.get("GROUPME_API_BASE", "https://api.groupme.com/v3").rstrip("/")
+GROUPME_IMAGE_API = os.environ.get("GROUPME_IMAGE_API", "https://image.groupme.com").rstrip("/")
 GROUPME_POLL_SECONDS = max(5, int(os.environ.get("GROUPME_POLL_SECONDS", "10")))
 GROUPME_REQUEST_DELAY_SECONDS = float(os.environ.get("GROUPME_REQUEST_DELAY_SECONDS", "1"))
 GROUPME_WEBHOOK_HOST = os.environ.get("GROUPME_WEBHOOK_HOST", "0.0.0.0")
@@ -70,6 +75,13 @@ GROUPME_HISTORY_LIMIT = 100
 MAX_GROUPME_IMAGES = 10
 MAX_DISCORD_FILES = 10
 DISCORD_FILE_LIMIT_BYTES = 8 * 1024 * 1024
+# Images are re-encoded down to this budget before being uploaded to GroupMe's
+# image service, and are downscaled to IMAGE_MAX_DIMENSION on the long edge.
+IMAGE_UPLOAD_LIMIT_BYTES = int(os.environ.get("IMAGE_UPLOAD_LIMIT_BYTES", str(8 * 1024 * 1024)))
+IMAGE_MAX_DIMENSION = max(256, int(os.environ.get("IMAGE_MAX_DIMENSION", "2048")))
+IMAGE_JPEG_QUALITY = min(95, max(50, int(os.environ.get("IMAGE_JPEG_QUALITY", "85"))))
+# Originals are read up to this size so they can be compressed; bigger ones are dropped.
+IMAGE_SOURCE_LIMIT_BYTES = max(IMAGE_UPLOAD_LIMIT_BYTES * 8, 32 * 1024 * 1024)
 WEBHOOK_NAME = "GroupMe Bridge"
 LINK_GROUPME = "groupme_to_discord"
 IMAGE_TYPES = {
@@ -689,12 +701,13 @@ async def download_groupme_images(
 async def download_discord_image(
     session: aiohttp.ClientSession, attachment: discord.Attachment
 ) -> tuple[bytes, str] | None:
-    """Fetch a Discord attachment so it can be re-hosted on GroupMe."""
-    if attachment.size and attachment.size > DISCORD_FILE_LIMIT_BYTES:
+    """Fetch and compress a Discord attachment so it can be re-hosted on GroupMe."""
+    if attachment.size and attachment.size > IMAGE_SOURCE_LIMIT_BYTES:
         log.warning(
-            "Skipping Discord attachment %s: larger than %d bytes",
+            "Skipping Discord attachment %s: %d bytes exceeds the %d byte source cap",
             attachment.filename,
-            DISCORD_FILE_LIMIT_BYTES,
+            attachment.size,
+            IMAGE_SOURCE_LIMIT_BYTES,
         )
         return None
     try:
@@ -704,17 +717,96 @@ async def download_discord_image(
             if response.status != 200:
                 log.warning("Could not download %s (%s)", attachment.url, response.status)
                 return None
-            data = await read_body_limited(response, DISCORD_FILE_LIMIT_BYTES)
+            data = await read_body_limited(response, IMAGE_SOURCE_LIMIT_BYTES)
             if data is None:
-                log.warning("Skipping %s: too large after download", attachment.filename)
+                log.warning("Skipping %s: larger than %d bytes", attachment.filename, IMAGE_SOURCE_LIMIT_BYTES)
                 return None
             if not data:
                 log.warning("Downloaded an empty body for %s", attachment.filename)
                 return None
-            return data, attachment.content_type or "image/jpeg"
+            content_type = attachment.content_type or "image/jpeg"
+            return await asyncio.to_thread(
+                compress_image, data, content_type, attachment.filename
+            )
     except (aiohttp.ClientError, asyncio.TimeoutError):
         log.exception("Download of Discord attachment %s failed", attachment.url)
         return None
+
+
+def compress_image(
+    data: bytes, content_type: str, label: str
+) -> tuple[bytes, str] | None:
+    """Return bytes ready for GroupMe, shrinking oversized images.
+
+    Images already within `IMAGE_UPLOAD_LIMIT_BYTES` and `IMAGE_MAX_DIMENSION` are
+    passed through untouched. Larger ones are downscaled and re-encoded as JPEG,
+    lowering quality until they fit. Returns None when the image cannot be handled.
+    """
+    if Image is None:
+        if len(data) <= IMAGE_UPLOAD_LIMIT_BYTES:
+            return data, content_type
+        log.warning("Pillow is missing; skipping oversized image %s", label)
+        return None
+
+    try:
+        image = Image.open(io.BytesIO(data))
+        image.load()
+    except Exception:
+        log.warning("Could not decode %s (%s)", label, content_type)
+        return (data, content_type) if len(data) <= IMAGE_UPLOAD_LIMIT_BYTES else None
+
+    try:
+        width, height = image.size
+        too_large = max(width, height) > IMAGE_MAX_DIMENSION
+        too_heavy = len(data) > IMAGE_UPLOAD_LIMIT_BYTES
+        if not too_large and not too_heavy:
+            return data, content_type
+
+        animated = bool(getattr(image, "is_animated", False))
+        if animated:
+            log.warning(
+                "Keeping animated %s untouched (%.1f MB, %dx%d); re-encoding would drop frames",
+                label,
+                len(data) / 1048576,
+                width,
+                height,
+            )
+            return (data, content_type) if not too_heavy else None
+
+        if image.mode in {"RGBA", "LA", "P"}:
+            rgba = image.convert("RGBA")
+            converted = Image.new("RGB", rgba.size, (255, 255, 255))
+            converted.paste(rgba, mask=rgba.split()[-1])
+        else:
+            converted = image.convert("RGB")
+
+        if too_large:
+            resample = getattr(Image, "Resampling", Image).LANCZOS
+            converted.thumbnail((IMAGE_MAX_DIMENSION, IMAGE_MAX_DIMENSION), resample)
+
+        quality = IMAGE_JPEG_QUALITY
+        while True:
+            buffer = io.BytesIO()
+            converted.save(buffer, format="JPEG", quality=quality, optimize=True)
+            payload = buffer.getvalue()
+            if len(payload) <= IMAGE_UPLOAD_LIMIT_BYTES or quality <= 40:
+                break
+            quality -= 10
+
+        log.info(
+            "Compressed %s: %.1f MB %dx%d -> %.1f MB %dx%d (q%d)",
+            label,
+            len(data) / 1048576,
+            width,
+            height,
+            len(payload) / 1048576,
+            converted.width,
+            converted.height,
+            quality,
+        )
+        return payload, "image/jpeg"
+    finally:
+        image.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -749,46 +841,74 @@ async def relay_discord_message(
         body = f"{body}\n" + "\n".join(overflow)
     images = images[:MAX_GROUPME_IMAGES]
 
+    # GroupMe only accepts i.groupme.com image URLs ("invalid origin" otherwise), so
+    # every image is compressed and re-hosted before the relay; failures are reported.
+    hosted: list[str] = []
+    failed = 0
+    for attachment in images:
+        url = await host_image_for_groupme(session, attachment)
+        if url is None:
+            failed += 1
+        else:
+            hosted.append(url)
+
+    note = f"\n[{failed} image(s) could not be relayed]" if failed else ""
+    if note:
+        body = truncate(body, GROUPME_TEXT_LIMIT - len(note)) + note
+    else:
+        body = truncate(body)
+
     if bridge["send_mode"] == "user":
-        await send_to_topic(session, bridge, truncate(body), images)
+        await send_to_topic(session, bridge, body, hosted)
     else:
         bot_id = bridge["bot_id"]
-        await groupme_post_bot(session, bot_id, truncate(body))
-        for attachment in images:
-            await groupme_post_bot(session, bot_id, "", picture_url=attachment.url)
+        await groupme_post_bot(session, bot_id, body)
+        for image_url in hosted:
+            await groupme_post_bot(session, bot_id, "", picture_url=image_url)
 
     log.info(
-        "Relayed Discord message %s from #%s to GroupMe conversation %s (%d image(s))",
+        "Relayed Discord message %s from #%s to GroupMe conversation %s (%d image(s), %d failed)",
         message.id,
         bridge["channel_id"],
         outbound_conversation_id(bridge),
-        len(images),
+        len(hosted),
+        failed,
     )
+
+
+async def host_image_for_groupme(
+    session: aiohttp.ClientSession, attachment: discord.Attachment
+) -> str | None:
+    """Download, compress, and re-host a Discord image on GroupMe's image service."""
+    if not GROUPME_ACCESS_TOKEN:
+        log.warning(
+            "GROUPME_ACCESS_TOKEN is unset; %s cannot be relayed (GroupMe only accepts i.groupme.com images)",
+            attachment.filename,
+        )
+        return None
+    downloaded = await download_discord_image(session, attachment)
+    if downloaded is None:
+        return None
+    data, content_type = downloaded
+    try:
+        return await groupme_upload_image(session, data, content_type)
+    except GroupMeError:
+        log.exception("GroupMe image upload failed for %s", attachment.filename)
+        return None
 
 
 async def send_to_topic(
     session: aiohttp.ClientSession,
     bridge: sqlite3.Row,
     body: str,
-    images: list[discord.Attachment],
+    image_urls: list[str],
 ) -> None:
     """Post into a topic (subgroup); GroupMe only allows this with the user token."""
     if not GROUPME_ACCESS_TOKEN:
         raise GroupMeError(
             "GROUPME_ACCESS_TOKEN is required to post into a GroupMe topic"
         )
-    attachments: list[dict] = []
-    for attachment in images:
-        downloaded = await download_discord_image(session, attachment)
-        if downloaded is None:
-            continue
-        data, content_type = downloaded
-        try:
-            url = await groupme_upload_image(session, data, content_type)
-        except GroupMeError:
-            log.exception("GroupMe image upload failed for %s", attachment.filename)
-            continue
-        attachments.append({"type": "image", "url": url})
+    attachments = [{"type": "image", "url": url} for url in image_urls]
 
     conversation_id = outbound_conversation_id(bridge)
     created = await groupme_post_message(session, conversation_id, body, attachments)

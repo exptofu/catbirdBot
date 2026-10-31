@@ -871,11 +871,11 @@ def bridged_channel_id(message: discord.Message) -> int:
 def groupme_content_for_discord(
     bridge: sqlite3.Row, conversation_id: str, text: str
 ) -> str:
-    """Prefix topic messages with #topic so one channel can carry main chat and topic."""
+    """Prefix topic messages with `#topic:` so the channel shows where they came from."""
     topic_id = bridge["topic_id"] or ""
     if topic_id and str(conversation_id) == str(topic_id):
         label = f"#{bridge['topic_name'] or topic_id}"
-        return f"{label} {text}".strip()
+        return f"{label}: {text}".rstrip()
     return text
 
 
@@ -1407,7 +1407,7 @@ async def bridge_add(
         description += (
             "\nThe group's main chat and this topic are both relayed here; "
             "Discord messages are posted into the topic. GroupMe messages from the "
-            f"topic arrive prefixed with `#{topic_name or topic_id}`."
+            f"topic arrive prefixed with `#{topic_name or topic_id}:`."
         )
     if moved_from:
         description += f"\nThe bridge moved from <#{moved_from}>."

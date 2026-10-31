@@ -88,6 +88,8 @@ A GroupMe **topic** is a subgroup with its own message stream, its own id, and n
 
 `POST /groups/{id}/messages` is the only way to write into a topic; creating a bot for a subgroup returns `401`, and topic messages never trigger bot callbacks, which is why they are polled.
 
+A topic bridge still gets a bot on the **parent** group — it never posts with it, but that bot is what makes the group's main chat arrive by callback. If no bot can be created (or one was removed later), the bot falls back to polling the parent group, so main-chat messages still arrive, just on the `GROUPME_POLL_SECONDS` cadence.
+
 ### Bot avatars
 
 GroupMe bots support a `bot[avatar_url]`, but **only** when it points at `i.groupme.com`; any other origin is silently dropped (`avatar_url: null`). Bots created by `/bridge add` therefore get the Discord bot's own avatar, downloaded and re-hosted on GroupMe's image service automatically (override with `GROUPME_BOT_AVATAR_URL`, or pass `image_url` to `/bridge set-avatar`). GroupMe exposes no bot update call, so changing an avatar recreates the bot — `/bridge set-avatar` does that and stores the new bot id.

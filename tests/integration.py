@@ -243,25 +243,30 @@ async def main():
 
         assert await bot.groupme_list_messages(session, "G1", since_id="5") == []
 
-        bot.save_bridge("G1", 555, "bot-1", "Testers")
-        bot.save_bridge("G2", 777, "", "Topic Group", topic_id="T1", topic_name="cobb", send_mode="user")
-        topic_bridge = bot.bridge_for_group("G2")
-        assert bot.bridge_for_conversation("T1")["group_id"] == "G2"
-        assert bot.bridge_for_conversation("G2")["group_id"] == "G2"
+        bot.save_bridge("G1", 555, "bot-1", "Testers", group_name="Testers")
+        bot.save_bridge(
+            "T1",
+            777,
+            "",
+            "cobb",
+            conversation_type="topic",
+            group_id="G2",
+            group_name="Topic Group",
+            send_mode="user",
+        )
+        topic_bridge = bot.bridge_for_conversation("T1")
+        assert bot.bridge_for_conversation("T1")["conversation_id"] == "T1"
+        assert bot.bridge_for_conversation("G2") is None
+        assert bot.bridge_for_destination(777)["group_id"] == "G2"
         assert bot.outbound_conversation_id(topic_bridge) == "T1"
-        assert bot.outbound_conversation_id(bot.bridge_for_group("G1")) == "G1"
+        assert bot.outbound_conversation_id(bot.bridge_for_conversation("G1")) == "G1"
 
         targets = dict(bot.poll_targets())
+        # topics are always polled; a main-chat bridge with a bot is callback-driven
         assert "T1" in targets and "G1" not in targets, targets
-        # a topic bridge with no bot also polls the parent's main chat
-        assert "G2" in targets, targets
+        assert "G2" not in targets, targets
 
-        assert bot.groupme_content_for_discord(bot.bridge_for_group("G1"), "G1", "hi") == "hi"
-        assert bot.groupme_content_for_discord(topic_bridge, "G2", "hi") == "hi"
-        assert bot.groupme_content_for_discord(topic_bridge, "T1", "hi") == "#cobb: hi"
-        assert bot.groupme_content_for_discord(topic_bridge, "T1", "") == "#cobb:"
-
-        await bot.poll_conversation(session, "G1", bot.bridge_for_group("G1"))
+        await bot.poll_conversation(session, "G1", bot.bridge_for_conversation("G1"))
         assert bot.last_seen("G1") == "42"
 
         relayed = []
@@ -271,25 +276,25 @@ async def main():
 
         bot.client.process_groupme_message = fake_process
         bot.set_last_seen("G1", "6")
-        await bot.poll_conversation(session, "G1", bot.bridge_for_group("G1"))
+        await bot.poll_conversation(session, "G1", bot.bridge_for_conversation("G1"))
         assert relayed == ["10", "11", "12"], relayed
         assert bot.last_seen("G1") == "12"
 
         # bot mode: text first, then one picture per image, both re-hosted
         POSTED_BOT.clear()
         UPLOADS.clear()
-        await bot.relay_discord_message(session, Message(), bot.bridge_for_group("G1"))
+        await bot.relay_discord_message(session, Message(), bot.bridge_for_conversation("G1"))
         assert POSTED_BOT[0] == {"bot_id": "bot-1", "text": "Ann: hello group\nhttps://cdn.discordapp.com/b.pdf"}, POSTED_BOT[0]
         assert POSTED_BOT[1] == {"bot_id": "bot-1", "text": "Ann:", "picture_url": "https://i.groupme.com/test.jpg"}, POSTED_BOT[1]
         assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
         assert max(UPLOADS[0]["dims"]) <= 2048, UPLOADS[0]
 
         # a stale bot id is repaired from the account and the post retried
-        bot.save_bridge("G1", 555, "stale-bot", "Testers")
+        bot.save_bridge("G1", 555, "stale-bot", "Testers", group_name="Testers")
         POSTED_BOT.clear()
-        await bot.relay_discord_message(session, Message(), bot.bridge_for_group("G1"))
+        await bot.relay_discord_message(session, Message(), bot.bridge_for_conversation("G1"))
         assert POSTED_BOT and POSTED_BOT[0]["bot_id"] == "old-bot", POSTED_BOT
-        assert bot.bridge_for_group("G1")["bot_id"] == "old-bot"
+        assert bot.bridge_for_conversation("G1")["bot_id"] == "old-bot"
 
         # a failed upload is reported in the message instead of posting a URL
         original_upload = bot.groupme_upload_image
@@ -300,7 +305,7 @@ async def main():
         bot.groupme_upload_image = failing_upload
         try:
             POSTED_BOT.clear()
-            await bot.relay_discord_message(session, Message(), bot.bridge_for_group("G1"))
+            await bot.relay_discord_message(session, Message(), bot.bridge_for_conversation("G1"))
             assert len(POSTED_BOT) == 1, POSTED_BOT
             assert POSTED_BOT[0]["text"].endswith("[1 image(s) could not be relayed]"), POSTED_BOT[0]
         finally:
@@ -309,7 +314,7 @@ async def main():
         # topic mode: one message carrying re-hosted attachments
         POSTED_MESSAGE.clear()
         UPLOADS.clear()
-        await bot.relay_discord_message(session, Message(), topic_bridge)
+        await bot.relay_discord_message(session, Message(), bot.bridge_for_conversation("T1"))
         assert len(POSTED_MESSAGE) == 1, POSTED_MESSAGE
         sent = POSTED_MESSAGE[0]
         assert sent["text"].startswith("Ann: hello group")

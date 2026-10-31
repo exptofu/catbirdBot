@@ -51,64 +51,57 @@ async def cmd_ensure(session: aiohttp.ClientSession, group_id: str) -> None:
     print(note or "no bot available")
     if not bot_id:
         return
-    bridge = bot.bridge_for_group(group_id)
-    if bridge is None:
+    bridges = bot.bridges_for_group(group_id)
+    if not bridges:
         print(f"bot_id={bot_id} (no bridge yet; pass it to /bridge add)")
         return
-    bot.save_bridge(
-        group_id,
-        int(bridge["channel_id"]),
-        bot_id,
-        bridge["group_name"],
-        topic_id=bridge["topic_id"],
-        topic_name=bridge["topic_name"],
-        send_mode=bridge["send_mode"] or "bot",
-    )
-    print(f"bridge for {group_id} now uses {bot_id}")
+    for bridge in bridges:
+        if bridge["conversation_type"] != "group":
+            # Topic bridges post with the access token, so they have no bot to update.
+            continue
+        bot.set_bridge_bot(bridge["conversation_id"], bot_id)
+        print(f"bridge for {bot.conversation_label(bridge)} now uses {bot_id}")
 
 
 async def cmd_repair(session: aiohttp.ClientSession) -> None:
     known = {str(entry.get("bot_id")) for entry in await bot.groupme_list_bots(session)}
     for bridge in bot.list_bridges():
         stored = bridge["bot_id"] or ""
-        if stored and stored in known:
-            print(f"{bridge['group_id']}: bot {stored} ok")
+        if not stored:
+            continue
+        label = bot.conversation_label(bridge)
+        if stored in known:
+            print(f"{label}: bot {stored} ok")
             continue
         try:
             new_id = await bot.recover_bot_id(session, bridge)
         except bot.GroupMeError as error:
-            print(f"{bridge['group_id']}: repair failed: {error}")
+            print(f"{label}: repair failed: {error}")
             continue
-        print(f"{bridge['group_id']}: replaced {stored or '(none)'} with {new_id}")
+        print(f"{label}: replaced {stored or '(none)'} with {new_id}")
 
 
 async def cmd_resync_avatars(session: aiohttp.ClientSession) -> None:
     for bridge in bot.list_bridges():
+        if not bridge["bot_id"]:
+            continue
+        label = bot.conversation_label(bridge)
         group_id = bridge["group_id"]
-        if bridge["bot_id"]:
-            try:
-                await bot.groupme_destroy_bot(session, bridge["bot_id"])
-            except bot.GroupMeError as error:
-                print(f"{group_id}: could not remove {bridge['bot_id']}: {error}")
-                continue
+        try:
+            await bot.groupme_destroy_bot(session, bridge["bot_id"])
+        except bot.GroupMeError as error:
+            print(f"{label}: could not remove {bridge['bot_id']}: {error}")
+            continue
         avatar = await bot.fresh_bot_avatar(session)
         created = await bot.groupme_create_bot(
             session, group_id, bot.GROUPME_BOT_NAME, bot.callback_url(), avatar
         )
         new_id = str(created.get("bot_id") or "")
         if not new_id:
-            print(f"{group_id}: bot recreation failed")
+            print(f"{label}: bot recreation failed")
             continue
-        bot.save_bridge(
-            group_id,
-            int(bridge["channel_id"]),
-            new_id,
-            bridge["group_name"],
-            topic_id=bridge["topic_id"],
-            topic_name=bridge["topic_name"],
-            send_mode=bridge["send_mode"] or "bot",
-        )
-        print(f"{group_id}: {new_id} | avatar {created.get('avatar_url') or '(none)'}")
+        bot.set_bridge_bot(bridge["conversation_id"], new_id)
+        print(f"{label}: {new_id} | avatar {created.get('avatar_url') or '(none)'}")
 
 
 async def main() -> int:

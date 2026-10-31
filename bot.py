@@ -69,7 +69,10 @@ GROUPME_PAYLOAD_LOG = os.environ.get("GROUPME_PAYLOAD_LOG", "groupme_payloads.js
 PUBLIC_BASE_URL = GROUPME_PUBLIC_URL
 
 MAX_RETRIES = 5
-SCHEMA_VERSION = 1
+# 2: bridges key on the GroupMe conversation and record the Discord target kind
+# (plain channel vs forum post/thread). Changing this rebuilds the tables, so the
+# bridges have to be recreated with `/bridge add`.
+SCHEMA_VERSION = 2
 GROUPME_TEXT_LIMIT = 1000
 GROUPME_HISTORY_LIMIT = 100
 MAX_GROUPME_IMAGES = 10
@@ -133,11 +136,6 @@ def from_epoch(value) -> datetime:
         return utcnow()
 
 
-# GroupMe does not document topics. These are the fields a topic-aware payload is
-# most likely to carry; `groupme_topic_of` degrades to "" when none are present.
-TOPIC_KEYS = ("topic_id", "topic", "topic_name", "group_topic_id", "subgroup_id")
-
-
 def append_payload_log(payload: dict) -> None:
     """Append a raw GroupMe payload to disk so undocumented fields can be inspected."""
     try:
@@ -150,47 +148,33 @@ def append_payload_log(payload: dict) -> None:
         log.exception("Could not append to %s", GROUPME_PAYLOAD_LOG)
 
 
-def groupme_topic_of(message: dict) -> str:
-    """Return the topic marker of a GroupMe message, or "" when GroupMe sends none."""
-    for key in TOPIC_KEYS:
-        value = message.get(key)
-        if isinstance(value, dict):
-            value = value.get("id") or value.get("name") or value.get("topic_id")
-        if value:
-            return str(value).strip()
-    return ""
-
-
 # --------------------------------------------------------------------------- #
 # Local state
 # --------------------------------------------------------------------------- #
 
 db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
-if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
-    db.executescript(
-        """
-        DROP TABLE IF EXISTS bridges;
-        DROP TABLE IF EXISTS group_state;
-        DROP TABLE IF EXISTS message_links;
-        """
-    )
-db.executescript(
-    f"""
-    -- One GroupMe conversation <-> one Discord channel.
-    -- group_id is the parent group; topic_id is set for topic (subgroup) bridges.
+
+CREATE_SQL = f"""
+    -- Exactly one GroupMe conversation <-> one Discord destination.
+    -- conversation_id is a group id for main-chat bridges and a subgroup (topic) id
+    -- for topic bridges; group_id always points at the parent group.
     CREATE TABLE IF NOT EXISTS bridges (
-        group_id TEXT PRIMARY KEY,
-        channel_id INTEGER NOT NULL UNIQUE,
-        bot_id TEXT NOT NULL DEFAULT '',
+        conversation_id TEXT PRIMARY KEY,
+        conversation_type TEXT NOT NULL DEFAULT 'group',
+        group_id TEXT NOT NULL,
         group_name TEXT NOT NULL DEFAULT '',
+        conversation_name TEXT NOT NULL DEFAULT '',
+        channel_id INTEGER NOT NULL UNIQUE,
+        target_kind TEXT NOT NULL DEFAULT 'channel',
+        parent_id INTEGER,
+        bot_id TEXT NOT NULL DEFAULT '',
         webhook_id INTEGER,
         webhook_token TEXT,
-        topic_id TEXT NOT NULL DEFAULT '',
-        topic_name TEXT NOT NULL DEFAULT '',
         send_mode TEXT NOT NULL DEFAULT 'bot',
         created_at TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS bridges_group ON bridges (group_id);
     -- Last GroupMe message id relayed (or baselined) per conversation id.
     CREATE TABLE IF NOT EXISTS group_state (
         group_id TEXT PRIMARY KEY,
@@ -208,94 +192,136 @@ db.executescript(
     );
     CREATE INDEX IF NOT EXISTS message_links_source ON message_links (direction, source_id);
     PRAGMA user_version = {SCHEMA_VERSION};
-    """
-)
-db.commit()
+"""
+
+DROP_SQL = """
+    DROP TABLE IF EXISTS bridges;
+    DROP TABLE IF EXISTS bridges_v1;
+    DROP TABLE IF EXISTS group_state;
+    DROP TABLE IF EXISTS message_links;
+"""
 
 
-def migrate_bridges() -> None:
-    """Add topic columns to databases created before topic bridges existed."""
-    existing = {row["name"] for row in db.execute("PRAGMA table_info(bridges)")}
-    for name, ddl in (
-        ("topic_id", "TEXT NOT NULL DEFAULT ''"),
-        ("topic_name", "TEXT NOT NULL DEFAULT ''"),
-        ("send_mode", "TEXT NOT NULL DEFAULT 'bot'"),
-    ):
-        if name in existing:
-            continue
-        db.execute(f"ALTER TABLE bridges ADD COLUMN {name} {ddl}")
-        log.info("Migrated bridges table: added %s", name)
+def init_db() -> None:
+    """Create the schema. A database from any other version is rebuilt from scratch."""
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version != SCHEMA_VERSION:
+        log.warning(
+            "Schema version %s (expected %s); recreating the bridge tables",
+            version,
+            SCHEMA_VERSION,
+        )
+        db.executescript(DROP_SQL)
+    db.executescript(CREATE_SQL)
     db.commit()
 
 
-migrate_bridges()
-
-
-def bridge_for_group(group_id: str) -> sqlite3.Row | None:
-    return db.execute("SELECT * FROM bridges WHERE group_id=?", (str(group_id),)).fetchone()
+init_db()
 
 
 def bridge_for_conversation(conversation_id: str) -> sqlite3.Row | None:
-    """Look up a bridge by topic (subgroup) id, then by parent group id."""
-    conversation_id = str(conversation_id)
-    row = db.execute(
-        "SELECT * FROM bridges WHERE topic_id=? AND topic_id<>''", (conversation_id,)
+    """The bridge for a GroupMe conversation: a main-chat (group) id or a topic id."""
+    return db.execute(
+        "SELECT * FROM bridges WHERE conversation_id=?", (str(conversation_id),)
     ).fetchone()
-    if row is not None:
-        return row
-    return bridge_for_group(conversation_id)
 
 
-def bridge_for_channel(channel_id: int) -> sqlite3.Row | None:
-    return db.execute("SELECT * FROM bridges WHERE channel_id=?", (int(channel_id),)).fetchone()
+def bridges_for_group(group_id: str) -> list[sqlite3.Row]:
+    """Every bridge fed by a GroupMe group: its main chat and any of its topics."""
+    return db.execute(
+        "SELECT * FROM bridges WHERE group_id=? ORDER BY conversation_type DESC",
+        (str(group_id),),
+    ).fetchall()
+
+
+def bridge_for_destination(channel_id: int) -> sqlite3.Row | None:
+    """The bridge that writes into a Discord channel, forum post, or thread."""
+    return db.execute(
+        "SELECT * FROM bridges WHERE channel_id=?", (int(channel_id),)
+    ).fetchone()
 
 
 def list_bridges() -> list[sqlite3.Row]:
-    return db.execute("SELECT * FROM bridges ORDER BY group_name COLLATE NOCASE").fetchall()
+    return db.execute(
+        "SELECT * FROM bridges ORDER BY group_name COLLATE NOCASE, conversation_name COLLATE NOCASE"
+    ).fetchall()
 
 
 def outbound_conversation_id(bridge: sqlite3.Row) -> str:
     """Where Discord messages for this bridge are posted."""
-    topic_id = bridge["topic_id"] if "topic_id" in bridge.keys() else ""
-    return str(topic_id or bridge["group_id"])
+    return str(bridge["conversation_id"])
+
+
+def webhook_channel_id(bridge: sqlite3.Row) -> int:
+    """Channel that owns the bridge webhook: the parent, for forum post/thread targets."""
+    parent_id = bridge["parent_id"]
+    if bridge["target_kind"] == "thread" and parent_id:
+        return int(parent_id)
+    return int(bridge["channel_id"])
+
+
+def conversation_label(bridge: sqlite3.Row) -> str:
+    """`GroupName`, or `#topic` for a topic bridge."""
+    name = bridge["conversation_name"] or bridge["conversation_id"]
+    if bridge["conversation_type"] == "topic":
+        return f"#{bridge['conversation_name'] or bridge['conversation_id']}"
+    return bridge["group_name"] or name
+
+
+def destination_label(bridge: sqlite3.Row) -> str:
+    label = f"<#{bridge['channel_id']}>"
+    if bridge["target_kind"] == "thread":
+        label += " (post)"
+    return label
 
 
 def save_bridge(
-    group_id: str,
+    conversation_id: str,
     channel_id: int,
     bot_id: str,
-    group_name: str,
+    conversation_name: str,
+    *,
+    conversation_type: str = "group",
+    group_id: str = "",
+    group_name: str = "",
+    target_kind: str = "channel",
+    parent_id: int | None = None,
     webhook_id: int | None = None,
     webhook_token: str | None = None,
-    topic_id: str = "",
-    topic_name: str = "",
     send_mode: str = "bot",
 ) -> None:
     db.execute(
         """
         INSERT INTO bridges
-            (group_id, channel_id, bot_id, group_name, webhook_id, webhook_token,
-             topic_id, topic_name, send_mode, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(group_id) DO UPDATE SET
-            channel_id=excluded.channel_id,
-            bot_id=excluded.bot_id,
+            (conversation_id, conversation_type, group_id, group_name, conversation_name,
+             channel_id, target_kind, parent_id, bot_id, webhook_id, webhook_token,
+             send_mode, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(conversation_id) DO UPDATE SET
+            conversation_type=excluded.conversation_type,
+            group_id=excluded.group_id,
             group_name=excluded.group_name,
+            conversation_name=excluded.conversation_name,
+            channel_id=excluded.channel_id,
+            target_kind=excluded.target_kind,
+            parent_id=excluded.parent_id,
+            bot_id=excluded.bot_id,
             webhook_id=COALESCE(excluded.webhook_id, bridges.webhook_id),
             webhook_token=COALESCE(excluded.webhook_token, bridges.webhook_token),
-            topic_id=excluded.topic_id,
-            topic_name=excluded.topic_name,
             send_mode=excluded.send_mode
         """,
         (
-            str(group_id),
-            int(channel_id),
-            bot_id,
+            str(conversation_id),
+            conversation_type,
+            str(group_id or conversation_id),
             group_name,
+            conversation_name,
+            int(channel_id),
+            target_kind,
+            int(parent_id) if parent_id else None,
+            bot_id,
             webhook_id,
             webhook_token,
-            str(topic_id or ""),
-            topic_name,
             send_mode,
             iso(utcnow()),
         ),
@@ -303,23 +329,81 @@ def save_bridge(
     db.commit()
 
 
-def save_webhook(group_id: str, webhook_id: int, webhook_token: str) -> None:
+def set_bridge_bot(conversation_id: str, bot_id: str) -> None:
     db.execute(
-        "UPDATE bridges SET webhook_id=?, webhook_token=? WHERE group_id=?",
-        (int(webhook_id), webhook_token, str(group_id)),
+        "UPDATE bridges SET bot_id=? WHERE conversation_id=?",
+        (bot_id, str(conversation_id)),
     )
     db.commit()
 
 
-def delete_bridge(group_id: str) -> None:
-    bridge = bridge_for_group(group_id)
-    db.execute("DELETE FROM bridges WHERE group_id=?", (str(group_id),))
-    db.execute("DELETE FROM group_state WHERE group_id=?", (str(group_id),))
-    db.execute("DELETE FROM message_links WHERE group_id=?", (str(group_id),))
-    if bridge is not None and bridge["topic_id"]:
-        topic_id = str(bridge["topic_id"])
-        db.execute("DELETE FROM group_state WHERE group_id=?", (topic_id,))
-        db.execute("DELETE FROM message_links WHERE group_id=?", (topic_id,))
+def update_bridge_conversation(
+    old_conversation_id: str,
+    conversation_id: str,
+    conversation_type: str,
+    conversation_name: str,
+    send_mode: str,
+    *,
+    group_id: str = "",
+    group_name: str = "",
+    bot_id: str | None = None,
+) -> None:
+    """Point an existing bridge (same Discord destination) at another conversation."""
+    if bot_id is None:
+        db.execute(
+            """
+            UPDATE bridges
+               SET conversation_id=?, conversation_type=?, conversation_name=?, send_mode=?,
+                   group_id=COALESCE(NULLIF(?, ''), group_id),
+                   group_name=COALESCE(NULLIF(?, ''), group_name)
+             WHERE conversation_id=?
+            """,
+            (
+                str(conversation_id),
+                conversation_type,
+                conversation_name,
+                send_mode,
+                str(group_id),
+                group_name,
+                str(old_conversation_id),
+            ),
+        )
+    else:
+        db.execute(
+            """
+            UPDATE bridges
+               SET conversation_id=?, conversation_type=?, conversation_name=?, send_mode=?,
+                   bot_id=?,
+                   group_id=COALESCE(NULLIF(?, ''), group_id),
+                   group_name=COALESCE(NULLIF(?, ''), group_name)
+             WHERE conversation_id=?
+            """,
+            (
+                str(conversation_id),
+                conversation_type,
+                conversation_name,
+                send_mode,
+                bot_id,
+                str(group_id),
+                group_name,
+                str(old_conversation_id),
+            ),
+        )
+    db.commit()
+
+
+def save_webhook(conversation_id: str, webhook_id: int, webhook_token: str) -> None:
+    db.execute(
+        "UPDATE bridges SET webhook_id=?, webhook_token=? WHERE conversation_id=?",
+        (int(webhook_id), webhook_token, str(conversation_id)),
+    )
+    db.commit()
+
+
+def delete_bridge(conversation_id: str) -> None:
+    db.execute("DELETE FROM bridges WHERE conversation_id=?", (str(conversation_id),))
+    db.execute("DELETE FROM group_state WHERE group_id=?", (str(conversation_id),))
+    db.execute("DELETE FROM message_links WHERE group_id=?", (str(conversation_id),))
     db.commit()
 
 
@@ -892,22 +976,8 @@ def compress_image(
 
 
 def bridged_channel_id(message: discord.Message) -> int:
-    """Thread messages are bridged through their parent channel's bridge."""
-    channel = message.channel
-    if isinstance(channel, discord.Thread) and channel.parent_id:
-        return channel.parent_id
-    return channel.id
-
-
-def groupme_content_for_discord(
-    bridge: sqlite3.Row, conversation_id: str, text: str
-) -> str:
-    """Prefix topic messages with `#topic:` so the channel shows where they came from."""
-    topic_id = bridge["topic_id"] or ""
-    if topic_id and str(conversation_id) == str(topic_id):
-        label = f"#{bridge['topic_name'] or topic_id}"
-        return f"{label}: {text}".rstrip()
-    return text
+    """The Discord destination a message was sent in: a channel, or a forum post/thread."""
+    return message.channel.id
 
 
 async def relay_discord_message(
@@ -997,16 +1067,10 @@ async def recover_bot_id(
         bot_id = str(created.get("bot_id") or "")
     if not bot_id:
         raise GroupMeError(f"could not obtain a GroupMe bot for group {group_id}")
-    save_bridge(
-        group_id,
-        int(bridge["channel_id"]),
-        bot_id,
-        bridge["group_name"],
-        topic_id=bridge["topic_id"],
-        topic_name=bridge["topic_name"],
-        send_mode=bridge["send_mode"] or "bot",
+    set_bridge_bot(bridge["conversation_id"], bot_id)
+    log.warning(
+        "Replaced stale GroupMe bot id for group %s with %s", group_id, bot_id
     )
-    log.warning("Replaced stale GroupMe bot id for group %s with %s", group_id, bot_id)
     return bot_id
 
 
@@ -1177,29 +1241,15 @@ def find_topic(topics: list[dict], query: str) -> dict | None:
     return None
 
 
-async def bridge_autocomplete(
-    interaction: discord.Interaction, current: str
+async def topic_choices(
+    interaction: discord.Interaction, group_id: str, current: str
 ) -> list[app_commands.Choice[str]]:
-    current = (current or "").lower()
-    choices = []
-    for bridge in list_bridges():
-        label = f"{bridge['group_name'] or 'Unnamed group'} ({bridge['group_id']})"
-        if current in label.lower() or current in bridge["group_id"]:
-            choices.append(app_commands.Choice(name=label[:100], value=bridge["group_id"]))
-    return choices[:25]
-
-
-async def topic_autocomplete(
-    interaction: discord.Interaction, current: str
-) -> list[app_commands.Choice[str]]:
-    """Offer the topics of whichever group id is already typed in the command."""
-    if not GROUPME_ACCESS_TOKEN:
-        return []
-    group_id = parse_group_id(str(interaction.namespace.group_id or ""))
-    if not group_id.isdigit():
+    if not GROUPME_ACCESS_TOKEN or not str(group_id).isdigit():
         return []
     try:
-        topics = await groupme_list_subgroups(interaction.client.groupme_session, group_id)
+        topics = await groupme_list_subgroups(
+            interaction.client.groupme_session, str(group_id)
+        )
     except (GroupMeError, aiohttp.ClientError):
         return []
     current = (current or "").casefold().lstrip("#")
@@ -1210,6 +1260,83 @@ async def topic_autocomplete(
         if current in name.casefold() or current in topic_id:
             choices.append(app_commands.Choice(name=f"#{name}"[:100], value=name[:100]))
     return choices[:25]
+
+
+async def topic_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Offer the topics of whichever group id is already typed in the command."""
+    group_id = parse_group_id(str(getattr(interaction.namespace, "group_id", "") or ""))
+    return await topic_choices(interaction, group_id, current)
+
+
+async def topic_autocomplete_here(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Offer the topics of the group behind the bridge on this channel or post."""
+    bridge = bridge_for_destination(getattr(interaction.channel, "id", 0) or 0)
+    if bridge is None:
+        return []
+    return await topic_choices(interaction, bridge["group_id"], current)
+
+
+class TargetError(Exception):
+    """The command was run somewhere that cannot host a bridge."""
+
+
+def resolve_target(channel) -> tuple[str, int, int | None]:
+    """Describe where the command was run: `(kind, destination_id, parent_id)`.
+
+    `kind` is `'channel'` for a text channel, `'thread'` for a forum post or thread,
+    and `'forum'` when the command ran on the forum itself, in which case the caller
+    creates a post and uses that instead.
+    """
+    if isinstance(channel, discord.Thread):
+        return "thread", channel.id, channel.parent_id
+    if isinstance(channel, discord.TextChannel):
+        return "channel", channel.id, None
+    if isinstance(channel, discord.ForumChannel):
+        return "forum", channel.id, None
+    raise TargetError(
+        "Run this command in a text channel, a forum channel, or a forum post."
+    )
+
+
+async def target_or_reply(interaction: discord.Interaction):
+    try:
+        return resolve_target(interaction.channel)
+    except TargetError as error:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⚠️ Unsupported channel",
+                description=str(error),
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return None
+
+
+async def bridge_for_target_or_reply(interaction: discord.Interaction):
+    """The bridge attached to the channel, forum post, or thread the command ran in."""
+    target = await target_or_reply(interaction)
+    if target is None:
+        return None
+    bridge = bridge_for_destination(target[1])
+    if bridge is None:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⚠️ Nothing bridged here",
+                description=(
+                    "This channel or post has no GroupMe bridge yet. Run `/bridge add` "
+                    "here to create one."
+                ),
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return None
+    return bridge
 
 
 async def require_manager(interaction: discord.Interaction) -> bool:
@@ -1230,27 +1357,48 @@ async def require_manager(interaction: discord.Interaction) -> bool:
 
 @bridge_group.command(
     name="add",
-    description="Bridge a GroupMe group, or a single topic inside it, to a Discord channel.",
+    description="Bridge a GroupMe group or one of its topics to this channel or forum post.",
 )
 @app_commands.autocomplete(topic=topic_autocomplete)
 @app_commands.describe(
     group_id="GroupMe group id (or a groupme.com join link)",
-    channel="Discord text channel that mirrors the conversation",
+    topic="Optional GroupMe topic name or id to mirror instead of the main chat",
     bot_id="Optional GroupMe bot id; leave empty to create one automatically",
-    topic="Optional GroupMe topic name or id: Discord posts go to this topic",
 )
 async def bridge_add(
     interaction: discord.Interaction,
     group_id: str,
-    channel: discord.TextChannel,
-    bot_id: str = "",
     topic: str = "",
+    bot_id: str = "",
 ):
+    """Bridge into wherever the command runs: a channel, a forum channel, or a post."""
     if not await require_manager(interaction):
         return
+    target = await target_or_reply(interaction)
+    if target is None:
+        return
+    kind, destination_id, parent_id = target
+
     group_id = parse_group_id(group_id)
     bot_id = (bot_id or "").strip()
     topic_query = (topic or "").strip()
+
+    if kind != "forum":
+        already = bridge_for_destination(destination_id)
+        if already is not None:
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="⚠️ Destination already bridged",
+                    description=(
+                        f"This {'post' if kind == 'thread' else 'channel'} already mirrors "
+                        f"**{conversation_label(already)}**. Bridges are one-to-one: remove "
+                        "that bridge first, or use `/bridge set-topic` to point it elsewhere."
+                    ),
+                    color=discord.Color.orange(),
+                ),
+                ephemeral=True,
+            )
+            return
 
     if not topic_query and not bot_id and not GROUPME_ACCESS_TOKEN:
         await interaction.response.send_message(
@@ -1259,21 +1407,6 @@ async def bridge_add(
                 description=(
                     "`bot_id` is optional only when `GROUPME_ACCESS_TOKEN` is set, "
                     "because the bot creates one for you. Pass a `bot_id` instead."
-                ),
-                color=discord.Color.orange(),
-            ),
-            ephemeral=True,
-        )
-        return
-
-    existing_channel = bridge_for_channel(channel.id)
-    if existing_channel is not None:
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="⚠️ Channel already bridged",
-                description=(
-                    f"{channel.mention} is already bridged to GroupMe group "
-                    f"`{existing_channel['group_id']}`. Remove that bridge first."
                 ),
                 color=discord.Color.orange(),
             ),
@@ -1357,54 +1490,132 @@ async def bridge_add(
             "from the authenticated GroupMe account, not a bot."
         )
 
-    if bot_id:
-        # Validate an explicit id so a typo does not fail later with a 404 on post.
-        if GROUPME_ACCESS_TOKEN:
-            try:
-                bots = await groupme_list_bots(session)
-            except GroupMeError:
-                bots = []
-            if bots and not any(str(b.get("bot_id")) == bot_id for b in bots):
-                warnings.append(
-                    f"Bot `{bot_id}` was not found on this GroupMe account; "
-                    "posting may fail with 404."
-                )
-    else:
-        # Every bridge needs a bot: group bridges post with it, and topic bridges need
-        # one so the group's main chat arrives through callbacks.
-        resolved, note = await ensure_group_bot(
-            session, group_id, await fresh_bot_avatar(session, interaction.client)
-        )
-        if note:
-            warnings.append(note)
-        if resolved:
-            bot_id = resolved
-        elif topic_row is None:
-            await interaction.followup.send(
-                embed=discord.Embed(
-                    title="❌ Bot creation failed",
-                    description=(
-                        "GroupMe did not return a usable bot for this group. Create one with "
-                        "`utils/groupme_setup.py` and pass its `bot_id`."
-                    ),
-                    color=discord.Color.red(),
+    conversation_id = str(topic_row.get("id")) if topic_row else group_id
+    conversation_type = "topic" if topic_row else "group"
+    group_name = (group or {}).get("name") or ""
+    conversation_name = (
+        (topic_row.get("topic") or "") if topic_row else (group_name or group_id)
+    )
+
+    clash = bridge_for_conversation(conversation_id)
+    if clash is not None:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="⚠️ Conversation already bridged",
+                description=(
+                    f"**{conversation_label(clash)}** already mirrors "
+                    f"{destination_label(clash)}. Every GroupMe conversation maps to one "
+                    "Discord destination, so remove that bridge first."
                 ),
-                ephemeral=True,
-            )
-            return
-        else:
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return
+
+    if topic_row:
+        # Topics cannot host bots: Discord messages are posted with the access token and
+        # the topic is polled, so a GroupMe bot plays no part in a topic bridge.
+        send_mode = "user"
+        if bot_id:
+            bot_id = ""
             warnings.append(
-                "No bot is available for this group, so the main chat is polled instead of "
-                "using callbacks and may lag by up to `GROUPME_POLL_SECONDS`."
+                "A topic bridge posts with `GROUPME_ACCESS_TOKEN`; `bot_id` is ignored."
             )
+    else:
+        send_mode = "bot"
+        if bot_id:
+            # Validate an explicit id so a typo does not fail later with a 404 on post.
+            if GROUPME_ACCESS_TOKEN:
+                try:
+                    bots = await groupme_list_bots(session)
+                except GroupMeError:
+                    bots = []
+                if bots and not any(str(b.get("bot_id")) == bot_id for b in bots):
+                    warnings.append(
+                        f"Bot `{bot_id}` was not found on this GroupMe account; "
+                        "posting may fail with 404."
+                    )
+        else:
+            # Main-chat bridges post through a GroupMe bot, so one is required here.
+            resolved, note = await ensure_group_bot(
+                session, group_id, await fresh_bot_avatar(session, interaction.client)
+            )
+            if note:
+                warnings.append(note)
+            if not resolved:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="❌ Bot creation failed",
+                        description=(
+                            "GroupMe did not return a usable bot for this group. Create one with "
+                            "`utils/groupme_setup.py` and pass its `bot_id`."
+                        ),
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+            bot_id = resolved
     if bot_id and not callback_url() and GROUPME_MODE == "webhook":
         warnings.append(
             "The bot has no callback URL; set `GROUPME_PUBLIC_URL` or `NGROK_DOMAIN` so "
             "group messages arrive."
         )
 
+    # A forum channel is not a destination itself: create the post that the bridge
+    # will live in, then treat it like any other thread target.
+    target_kind = "thread" if kind in {"thread", "forum"} else "channel"
+    if topic_row:
+        mirrored_label = f"#{conversation_name} in group {group_name or group_id}"
+    else:
+        mirrored_label = group_name or group_id
+    if kind == "forum":
+        forum = interaction.channel
+        post_name = (
+            f"{group_name or group_id} · #{conversation_name}"
+            if topic_row
+            else (group_name or group_id)
+        )
+        try:
+            created = await forum.create_thread(
+                name=truncate(post_name, 100),
+                content=f"GroupMe bridge: {mirrored_label}",
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Cannot create a post",
+                    description=(
+                        "The bot needs Create Posts (and View Channel) in this forum channel "
+                        "to make the post the bridge will live in."
+                    ),
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as error:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Could not create the post",
+                    description=f"Discord rejected the request: `{error}`",
+                    color=discord.Color.red(),
+                ),
+                ephemeral=True,
+            )
+            return
+        destination_id = created.thread.id
+        parent_id = forum.id
+
+    webhook_channel_id = int(parent_id) if target_kind == "thread" and parent_id else destination_id
     try:
-        webhook = await channel.create_webhook(name=WEBHOOK_NAME, reason="Catbird GroupMe bridge")
+        webhook_channel = interaction.client.get_channel(
+            webhook_channel_id
+        ) or await interaction.client.fetch_channel(webhook_channel_id)
+        webhook = await webhook_channel.create_webhook(
+            name=WEBHOOK_NAME, reason="Catbird GroupMe bridge"
+        )
     except discord.Forbidden:
         await interaction.followup.send(
             embed=discord.Embed(
@@ -1418,7 +1629,7 @@ async def bridge_add(
             ephemeral=True,
         )
         return
-    except discord.HTTPException as error:
+    except (discord.HTTPException, AttributeError) as error:
         await interaction.followup.send(
             embed=discord.Embed(
                 title="❌ Could not create webhook",
@@ -1429,74 +1640,47 @@ async def bridge_add(
         )
         return
 
-    group_name = (group or {}).get("name") or ""
-    topic_id = str(topic_row.get("id")) if topic_row else ""
-    topic_name = (topic_row.get("topic") or "") if topic_row else ""
-    send_mode = "user" if topic_row else "bot"
-
-    moved_from = None
-    existing_group = bridge_for_group(group_id)
-    if existing_group is not None and int(existing_group["channel_id"]) != channel.id:
-        moved_from = int(existing_group["channel_id"])
-        interaction.client.webhooks.pop(moved_from, None)
-        if existing_group["webhook_id"]:
-            try:
-                old_webhook = await interaction.client.fetch_webhook(
-                    int(existing_group["webhook_id"])
-                )
-                await old_webhook.delete(reason="GroupMe bridge moved to another channel")
-            except discord.HTTPException:
-                log.warning(
-                    "Could not delete webhook %s left behind by the move",
-                    existing_group["webhook_id"],
-                )
-
     save_bridge(
-        group_id,
-        channel.id,
+        conversation_id,
+        destination_id,
         bot_id,
-        group_name,
-        webhook.id,
-        webhook.token,
-        topic_id=topic_id,
-        topic_name=topic_name,
+        conversation_name,
+        conversation_type=conversation_type,
+        group_id=group_id,
+        group_name=group_name,
+        target_kind=target_kind,
+        parent_id=parent_id if target_kind == "thread" else None,
+        webhook_id=webhook.id,
+        webhook_token=webhook.token,
         send_mode=send_mode,
     )
-    interaction.client.webhooks[channel.id] = webhook
+    interaction.client.webhooks[destination_id] = webhook
 
-    last_message_id = ((group or {}).get("messages") or {}).get("last_message_id")
+    # Baseline only the conversation this bridge mirrors: everything older is history.
+    source = topic_row if topic_row else group
+    last_message_id = ((source or {}).get("messages") or {}).get("last_message_id")
     if last_message_id:
-        set_last_seen(group_id, str(last_message_id))
+        set_last_seen(conversation_id, str(last_message_id))
     else:
-        warnings.append("No message baseline was recorded; existing GroupMe history may be replayed.")
-
-    if topic_row:
-        topic_last = ((topic_row.get("messages") or {}).get("last_message_id"))
-        if topic_last:
-            set_last_seen(topic_id, str(topic_last))
-        else:
-            warnings.append(
-                f"No baseline for topic **{topic_name or topic_id}**; its history may be replayed."
-            )
+        warnings.append(
+            "No message baseline was recorded; existing GroupMe history may be replayed."
+        )
 
     await interaction.client.refresh_bot_names()
 
-    if topic_row:
-        target = f"topic **{topic_name or topic_id}** in group **{group_name or group_id}**"
-    else:
-        target = f"GroupMe group **{group_name or group_id}**"
-    description = f"{channel.mention} now mirrors {target}."
+    destination_text = f"<#{destination_id}>"
+    if target_kind == "thread":
+        destination_text += " (forum post)" if kind == "forum" else " (thread)"
+    description = f"{destination_text} now mirrors **{mirrored_label}**."
     if topic_row:
         description += (
-            "\nThe group's main chat and this topic are both relayed here; "
-            "Discord messages are posted into the topic. GroupMe messages from the "
-            f"topic arrive prefixed with `#{topic_name or topic_id}:`."
+            "\nOnly this topic is mirrored. Discord messages here are posted into it."
         )
-    if moved_from:
-        description += f"\nThe bridge moved from <#{moved_from}>."
+    else:
+        description += "\nOnly the group's main chat is mirrored; topics stay separate."
     if warnings:
         description += "\n\n" + "\n".join(f"⚠️ {warning}" for warning in warnings)
-    if GROUPME_MODE == "webhook":
+    if bot_id and GROUPME_MODE == "webhook":
         url = callback_url()
         if url:
             description += (
@@ -1561,59 +1745,92 @@ async def bridge_topics(interaction: discord.Interaction, group_id: str):
 
 @bridge_group.command(
     name="set-topic",
-    description="Send Discord messages to a different GroupMe topic, or back to the main chat.",
+    description="Mirror a different GroupMe topic here, or switch back to the main chat.",
 )
-@app_commands.autocomplete(group_id=bridge_autocomplete, topic=topic_autocomplete)
+@app_commands.autocomplete(topic=topic_autocomplete_here)
 @app_commands.describe(
-    group_id="GroupMe group id",
-    topic="Topic name or id (use 'none' to clear and post to the main chat)",
+    topic="Topic name or id (use 'none' to mirror the group's main chat instead)",
 )
-async def bridge_set_topic(interaction: discord.Interaction, group_id: str, topic: str):
+async def bridge_set_topic(interaction: discord.Interaction, topic: str):
+    """Retarget the bridge on this channel or post at another GroupMe conversation."""
     if not await require_manager(interaction):
         return
-    bridge = bridge_for_group(parse_group_id(group_id))
+    bridge = await bridge_for_target_or_reply(interaction)
     if bridge is None:
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="⚠️ No such bridge",
-                description=f"No bridge is registered for GroupMe group `{group_id}`.",
-                color=discord.Color.orange(),
-            ),
-            ephemeral=True,
-        )
         return
 
     await interaction.response.defer(ephemeral=True)
-    channel_id = int(bridge["channel_id"])
+    session = interaction.client.groupme_session
+    group_id = str(bridge["group_id"])
+    group_name = bridge["group_name"]
+    destination = int(bridge["channel_id"])
     topic_query = (topic or "").strip()
-    if topic_query.casefold() in {"", "none", "clear", "off"}:
-        if not bridge["bot_id"]:
+    if topic_query.casefold() in {"", "none", "clear", "off", "main"}:
+        if bridge["conversation_type"] == "group":
             await interaction.followup.send(
                 embed=discord.Embed(
-                    title="⚠️ Bot id needed",
+                    title="⚠️ Already the main chat",
                     description=(
-                        "This bridge has no GroupMe bot, so it cannot post to the main chat. "
-                        "Create a bot with `utils/groupme_setup.py` and run "
-                        "`/bridge set-bot` first."
+                        f"<#{destination}> already mirrors the main chat of "
+                        f"**{group_name or group_id}**."
                     ),
                     color=discord.Color.orange(),
                 ),
                 ephemeral=True,
             )
             return
-        save_bridge(
-            bridge["group_id"],
-            channel_id,
-            bridge["bot_id"],
-            bridge["group_name"],
-            topic_id="",
-            topic_name="",
-            send_mode="bot",
+        clash = bridge_for_conversation(group_id)
+        if clash is not None:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ Main chat already bridged",
+                    description=(
+                        f"The main chat of **{group_name or group_id}** already mirrors "
+                        f"{destination_label(clash)}. Remove that bridge first."
+                    ),
+                    color=discord.Color.orange(),
+                ),
+                ephemeral=True,
+            )
+            return
+        bot_id = bridge["bot_id"]
+        if not bot_id:
+            # The main chat is posted through a GroupMe bot, so make sure one exists.
+            bot_id, _note = await ensure_group_bot(
+                session, group_id, await fresh_bot_avatar(session, interaction.client)
+            )
+            if not bot_id:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="❌ No GroupMe bot",
+                        description=(
+                            "The main chat is posted through a GroupMe bot and one could not be "
+                            "created. Run `utils/groupme_setup.py`, then `/bridge set-bot`."
+                        ),
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+        update_bridge_conversation(
+            bridge["conversation_id"],
+            group_id,
+            "group",
+            group_name or group_id,
+            "bot",
+            bot_id=bot_id,
         )
+        group = await groupme_get_group(session, group_id)
+        last = ((group or {}).get("messages") or {}).get("last_message_id")
+        if last:
+            set_last_seen(group_id, str(last))
         await interaction.followup.send(
             embed=discord.Embed(
-                title="✅ Topic cleared",
-                description=f"Discord messages now post to the main chat of **{bridge['group_name'] or bridge['group_id']}**.",
+                title="✅ Now mirroring the main chat",
+                description=(
+                    f"<#{destination}> now mirrors the main chat of "
+                    f"**{group_name or group_id}**. Topic messages are no longer relayed here."
+                ),
                 color=discord.Color.green(),
             ),
             ephemeral=True,
@@ -1660,16 +1877,38 @@ async def bridge_set_topic(interaction: discord.Interaction, group_id: str, topi
 
     topic_id = str(topic_row.get("id"))
     topic_name = topic_row.get("topic") or topic_id
-    save_bridge(
-        bridge["group_id"],
-        channel_id,
-        bridge["bot_id"],
-        bridge["group_name"],
-        topic_id=topic_id,
-        topic_name=topic_name,
-        send_mode="user",
+    if topic_id == str(bridge["conversation_id"]):
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="⚠️ Already bridged",
+                description=f"<#{destination}> already mirrors topic **{topic_name}**.",
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return
+    clash = bridge_for_conversation(topic_id)
+    if clash is not None:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="⚠️ Topic already bridged",
+                description=(
+                    f"Topic **{topic_name}** already mirrors {destination_label(clash)}. "
+                    "Remove that bridge first."
+                ),
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return
+    update_bridge_conversation(
+        bridge["conversation_id"],
+        topic_id,
+        "topic",
+        topic_name,
+        "user",
     )
-    topic_last = ((topic_row.get("messages") or {}).get("last_message_id"))
+    topic_last = (topic_row.get("messages") or {}).get("last_message_id")
     if topic_last:
         set_last_seen(topic_id, str(topic_last))
 
@@ -1677,9 +1916,10 @@ async def bridge_set_topic(interaction: discord.Interaction, group_id: str, topi
         embed=discord.Embed(
             title="✅ Topic updated",
             description=(
-                f"Discord messages in <#{channel_id}> now post into topic "
-                f"**{topic_name}** (`{topic_id}`).\n"
-                "GroupMe messages from the main chat and this topic are both relayed here."
+                f"<#{destination}> now mirrors topic **{topic_name}** (`{topic_id}`) of "
+                f"**{group_name or group_id}**.\n"
+                "Discord messages here are posted into that topic, and GroupMe messages "
+                "from it are no longer relayed alongside the main chat."
             ),
             color=discord.Color.green(),
         ),
@@ -1687,22 +1927,12 @@ async def bridge_set_topic(interaction: discord.Interaction, group_id: str, topi
     )
 
 
-@bridge_group.command(name="remove", description="Remove a GroupMe group bridge.")
-@app_commands.autocomplete(group_id=bridge_autocomplete)
-@app_commands.describe(group_id="GroupMe group id to unbridge")
-async def bridge_remove(interaction: discord.Interaction, group_id: str):
+@bridge_group.command(name="remove", description="Remove the bridge on this channel or post.")
+async def bridge_remove(interaction: discord.Interaction):
     if not await require_manager(interaction):
         return
-    bridge = bridge_for_group(parse_group_id(group_id))
+    bridge = await bridge_for_target_or_reply(interaction)
     if bridge is None:
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="⚠️ No such bridge",
-                description=f"No bridge is registered for GroupMe group `{group_id}`.",
-                color=discord.Color.orange(),
-            ),
-            ephemeral=True,
-        )
         return
 
     await interaction.response.defer(ephemeral=True)
@@ -1712,14 +1942,18 @@ async def bridge_remove(interaction: discord.Interaction, group_id: str):
             webhook = await interaction.client.fetch_webhook(int(bridge["webhook_id"]))
             await webhook.delete(reason="GroupMe bridge removed")
         except (discord.NotFound, discord.Forbidden):
-            log.warning("Could not delete webhook %s while removing %s", bridge["webhook_id"], bridge["group_id"])
-    delete_bridge(bridge["group_id"])
+            log.warning(
+                "Could not delete webhook %s while removing %s",
+                bridge["webhook_id"],
+                bridge["conversation_id"],
+            )
+    delete_bridge(bridge["conversation_id"])
     await interaction.followup.send(
         embed=discord.Embed(
             title="✅ Bridge removed",
             description=(
-                f"Stopped mirroring GroupMe group **{bridge['group_name'] or bridge['group_id']}** "
-                f"to <#{bridge['channel_id']}>."
+                f"Stopped mirroring **{conversation_label(bridge)}** to "
+                f"<#{bridge['channel_id']}>."
             ),
             color=discord.Color.green(),
         ),
@@ -1727,37 +1961,36 @@ async def bridge_remove(interaction: discord.Interaction, group_id: str):
     )
 
 
-@bridge_group.command(name="set-bot", description="Change the GroupMe bot used by a bridge.")
-@app_commands.autocomplete(group_id=bridge_autocomplete)
-@app_commands.describe(group_id="GroupMe group id", bot_id="New GroupMe bot id")
-async def bridge_set_bot(interaction: discord.Interaction, group_id: str, bot_id: str):
+@bridge_group.command(name="set-bot", description="Change the GroupMe bot used by this bridge.")
+@app_commands.describe(bot_id="New GroupMe bot id")
+async def bridge_set_bot(interaction: discord.Interaction, bot_id: str):
     if not await require_manager(interaction):
         return
-    bridge = bridge_for_group(parse_group_id(group_id))
+    bridge = await bridge_for_target_or_reply(interaction)
     if bridge is None:
+        return
+    if bridge["conversation_type"] == "topic":
         await interaction.response.send_message(
             embed=discord.Embed(
-                title="⚠️ No such bridge",
-                description=f"No bridge is registered for GroupMe group `{group_id}`.",
+                title="⚠️ Topic bridge",
+                description=(
+                    "This bridge posts into a GroupMe topic with `GROUPME_ACCESS_TOKEN`, so it "
+                    "has no bot to change. Run `/bridge set-topic none` to switch it to the "
+                    "main chat first."
+                ),
                 color=discord.Color.orange(),
             ),
             ephemeral=True,
         )
         return
-    save_bridge(
-        bridge["group_id"],
-        int(bridge["channel_id"]),
-        bot_id.strip(),
-        bridge["group_name"],
-        topic_id=bridge["topic_id"],
-        topic_name=bridge["topic_name"],
-        send_mode=bridge["send_mode"],
-    )
+    set_bridge_bot(bridge["conversation_id"], bot_id.strip())
     await interaction.client.refresh_bot_names()
     await interaction.response.send_message(
         embed=discord.Embed(
             title="✅ Bot updated",
-            description=f"Group `{bridge['group_id']}` now posts with bot `{bot_id.strip()}`.",
+            description=(
+                f"**{conversation_label(bridge)}** now posts with bot `{bot_id.strip()}`."
+            ),
             color=discord.Color.green(),
         ),
         ephemeral=True,
@@ -1771,15 +2004,19 @@ async def bridge_list(interaction: discord.Interaction):
     bridges = list_bridges()
     embed = discord.Embed(title="GroupMe bridges", color=discord.Color.blurple())
     if not bridges:
-        embed.description = "No bridges yet. Use `/bridge add` to create one."
+        embed.description = "No bridges yet. Run `/bridge add` inside a channel or a forum post."
     for bridge in bridges[:25]:
-        target = f"group `{bridge['group_id']}`"
-        if bridge["topic_id"]:
-            target = f"topic **{bridge['topic_name'] or bridge['topic_id']}** (`{bridge['topic_id']}`)\nof group `{bridge['group_id']}`"
-        poster = "access token" if bridge["send_mode"] == "user" else f"bot `{bridge['bot_id']}`"
+        source = conversation_label(bridge)
+        if bridge["conversation_type"] == "topic":
+            source += f"\nof group `{bridge['group_id']}`"
+        poster = (
+            "access token"
+            if bridge["send_mode"] == "user"
+            else f"bot `{bridge['bot_id']}`"
+        )
         embed.add_field(
-            name=truncate(bridge["group_name"] or bridge["group_id"], 100),
-            value=f"<#{bridge['channel_id']}>\n{target}\nposts via {poster}",
+            name=truncate(bridge["group_name"] or source, 100),
+            value=f"{destination_label(bridge)}\n{source}\nposts via {poster}",
             inline=True,
         )
     embed.set_footer(text=f"{len(bridges)} bridge(s) · {GROUPME_MODE} mode")
@@ -1790,34 +2027,22 @@ async def bridge_list(interaction: discord.Interaction):
     name="set-avatar",
     description="Give the bridge's GroupMe bot the Discord bot's picture (recreates the bot).",
 )
-@app_commands.autocomplete(group_id=bridge_autocomplete)
 @app_commands.describe(
-    group_id="GroupMe group id",
     image_url="Optional image URL; defaults to the Discord bot's avatar",
 )
-async def bridge_set_avatar(
-    interaction: discord.Interaction, group_id: str, image_url: str = ""
-):
+async def bridge_set_avatar(interaction: discord.Interaction, image_url: str = ""):
     if not await require_manager(interaction):
         return
-    bridge = bridge_for_group(parse_group_id(group_id))
+    bridge = await bridge_for_target_or_reply(interaction)
     if bridge is None:
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="⚠️ No such bridge",
-                description=f"No bridge is registered for GroupMe group `{group_id}`.",
-                color=discord.Color.orange(),
-            ),
-            ephemeral=True,
-        )
         return
     if not bridge["bot_id"]:
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="⚠️ No GroupMe bot",
                 description=(
-                    "This bridge posts with the access token (topic bridge), so it has no bot "
-                    "avatar to set."
+                    "This bridge posts into a GroupMe topic with the access token, so it has "
+                    "no bot avatar to set."
                 ),
                 color=discord.Color.orange(),
             ),
@@ -1901,12 +2126,15 @@ async def bridge_set_avatar(
             return
 
     save_bridge(
-        bridge["group_id"],
+        bridge["conversation_id"],
         int(bridge["channel_id"]),
         new_bot_id,
-        bridge["group_name"],
-        topic_id=bridge["topic_id"],
-        topic_name=bridge["topic_name"],
+        bridge["conversation_name"],
+        conversation_type=bridge["conversation_type"],
+        group_id=bridge["group_id"],
+        group_name=bridge["group_name"],
+        target_kind=bridge["target_kind"],
+        parent_id=bridge["parent_id"],
         send_mode=bridge["send_mode"] or "bot",
     )
     await client.refresh_bot_names()
@@ -1924,27 +2152,17 @@ async def bridge_set_avatar(
 
 
 @bridge_group.command(name="test", description="Send a test message in both directions.")
-@app_commands.autocomplete(group_id=bridge_autocomplete)
-@app_commands.describe(group_id="GroupMe group id to test")
-async def bridge_test(interaction: discord.Interaction, group_id: str):
+async def bridge_test(interaction: discord.Interaction):
     if not await require_manager(interaction):
         return
-    bridge = bridge_for_group(parse_group_id(group_id))
+    bridge = await bridge_for_target_or_reply(interaction)
     if bridge is None:
-        await interaction.response.send_message(
-            embed=discord.Embed(
-                title="⚠️ No such bridge",
-                description=f"No bridge is registered for GroupMe group `{group_id}`.",
-                color=discord.Color.orange(),
-            ),
-            ephemeral=True,
-        )
         return
 
     await interaction.response.defer(ephemeral=True)
     session = interaction.client.groupme_session
     problems: list[str] = []
-    test_text = f"Catbird test message from Discord (#{interaction.channel.name})."
+    test_text = f"Catbird test message from Discord (#{getattr(interaction.channel, 'name', 'post')})."
     try:
         if bridge["send_mode"] == "user":
             await groupme_post_message(
@@ -1956,12 +2174,11 @@ async def bridge_test(interaction: discord.Interaction, group_id: str):
         problems.append(f"GroupMe post failed: `{error}`")
 
     try:
-        webhook = await interaction.client.get_webhook(bridge, refresh=True)
-        await webhook.send(
+        await interaction.client.send_via_webhook(
+            bridge,
             content="Catbird test message from GroupMe.",
             username=WEBHOOK_NAME,
             allowed_mentions=discord.AllowedMentions.none(),
-            wait=True,
         )
     except (discord.HTTPException, RuntimeError) as error:
         problems.append(f"Discord webhook failed: `{error}`")
@@ -1973,14 +2190,12 @@ async def bridge_test(interaction: discord.Interaction, group_id: str):
             color=discord.Color.orange(),
         )
     else:
-        where = (
-            f"topic **{bridge['topic_name'] or bridge['topic_id']}**"
-            if bridge["topic_id"]
-            else "the GroupMe group"
-        )
         embed = discord.Embed(
             title="✅ Test messages sent",
-            description=f"Check {where} and this channel.",
+            description=(
+                f"Check **{conversation_label(bridge)}** in GroupMe and "
+                f"{destination_label(bridge)} here."
+            ),
             color=discord.Color.green(),
         )
     await interaction.followup.send(embed=embed, ephemeral=True)
@@ -2120,7 +2335,9 @@ class Bot(discord.Client):
         else:
             log.info("GroupMe transport: poll (every %ds)", GROUPME_POLL_SECONDS)
 
-        topic_bridges = [bridge for bridge in list_bridges() if bridge["topic_id"]]
+        topic_bridges = [
+            bridge for bridge in list_bridges() if bridge["conversation_type"] == "topic"
+        ]
         if topic_bridges and not GROUPME_ACCESS_TOKEN:
             log.error(
                 "%d topic bridge(s) need GROUPME_ACCESS_TOKEN; they will not receive messages.",
@@ -2133,8 +2350,8 @@ class Bot(discord.Client):
                 GROUPME_POLL_SECONDS,
             )
 
-        # The loop is harmless when there is nothing to poll: topic bridges are
-        # polled in both transports, group bridges only when GROUPME_MODE=poll.
+        # The loop is harmless when there is nothing to poll: topics are always polled,
+        # main chats only when GROUPME_MODE=poll or the bridge has no bot.
         if not poll_groupme.is_running():
             poll_groupme.start()
 
@@ -2173,9 +2390,9 @@ class Bot(discord.Client):
         log.debug("Cached %d GroupMe bot name(s)", len(BOT_NAMES))
 
     async def get_webhook(self, bridge: sqlite3.Row, *, refresh: bool = False) -> discord.Webhook:
-        channel_id = int(bridge["channel_id"])
+        destination_id = int(bridge["channel_id"])
         if not refresh:
-            cached = self.webhooks.get(channel_id)
+            cached = self.webhooks.get(destination_id)
             if cached is not None:
                 return cached
 
@@ -2188,23 +2405,50 @@ class Bot(discord.Client):
                 await webhook.fetch()
             except discord.HTTPException:
                 log.warning(
-                    "Webhook %s for channel %s is unusable; creating a replacement",
+                    "Webhook %s for destination %s is unusable; creating a replacement",
                     bridge["webhook_id"],
-                    channel_id,
+                    destination_id,
                 )
                 webhook = None
 
         if webhook is None:
-            channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
-            if not isinstance(channel, discord.TextChannel):
-                raise RuntimeError(f"Channel {channel_id} is not a text channel")
+            # Forum posts and threads have no webhook of their own: the webhook lives on
+            # the parent channel and every post passes the thread id.
+            owner_id = webhook_channel_id(bridge)
+            channel = self.get_channel(owner_id) or await self.fetch_channel(owner_id)
+            if not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+                raise RuntimeError(f"Channel {owner_id} cannot host a webhook")
             webhook = await channel.create_webhook(
                 name=WEBHOOK_NAME, reason="Catbird GroupMe bridge"
             )
-            save_webhook(bridge["group_id"], webhook.id, webhook.token)
+            save_webhook(bridge["conversation_id"], webhook.id, webhook.token)
 
-        self.webhooks[channel_id] = webhook
+        self.webhooks[destination_id] = webhook
         return webhook
+
+    async def ensure_target_open(self, bridge: sqlite3.Row) -> None:
+        """Unarchive a forum post or thread so messages can be posted into it."""
+        if bridge["target_kind"] != "thread":
+            return
+        destination_id = int(bridge["channel_id"])
+        try:
+            thread = self.get_channel(destination_id) or await self.fetch_channel(destination_id)
+            if isinstance(thread, discord.Thread) and thread.archived:
+                await thread.edit(archived=False)
+                log.info("Unarchived thread %s to relay GroupMe messages", destination_id)
+        except discord.HTTPException:
+            log.warning("Could not unarchive thread %s", destination_id)
+
+    async def send_via_webhook(
+        self, bridge: sqlite3.Row, *, refresh: bool = False, **payload
+    ) -> discord.WebhookMessage:
+        """Post with the bridge webhook, into the thread when the destination is a post."""
+        await self.ensure_target_open(bridge)
+        webhook = await self.get_webhook(bridge, refresh=refresh)
+        if bridge["target_kind"] == "thread":
+            payload["thread"] = discord.Object(id=int(bridge["channel_id"]))
+        payload.setdefault("wait", True)
+        return await webhook.send(**payload)
 
     # -- GroupMe ingestion -------------------------------------------------- #
 
@@ -2248,7 +2492,6 @@ class Bot(discord.Client):
         image_urls = groupme_image_urls(message)
         if not text and not image_urls:
             return
-        text = groupme_content_for_discord(bridge, group_id, text)
 
         username = sanitize_webhook_name(message.get("name") or "GroupMe user")
         avatar_url = message.get("avatar_url") or None
@@ -2256,7 +2499,6 @@ class Bot(discord.Client):
         files: list[discord.File] = []
         for attempt in (1, 2):
             try:
-                webhook = await self.get_webhook(bridge, refresh=attempt == 2)
                 files = await download_groupme_images(self.groupme_session, image_urls)
                 if not text and not files:
                     log.warning(
@@ -2264,13 +2506,14 @@ class Bot(discord.Client):
                         message_id,
                     )
                     return
-                sent = await webhook.send(
+                sent = await self.send_via_webhook(
+                    bridge,
+                    refresh=attempt == 2,
                     content=text or None,
                     username=username,
                     avatar_url=avatar_url,
                     files=files,
                     allowed_mentions=discord.AllowedMentions.none(),
-                    wait=True,
                 )
                 break
             except (discord.NotFound, discord.Forbidden):
@@ -2309,7 +2552,7 @@ class Bot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.guild is None or message.author.bot or message.webhook_id is not None:
             return
-        bridge = bridge_for_channel(bridged_channel_id(message))
+        bridge = bridge_for_destination(bridged_channel_id(message))
         if bridge is None:
             return
         try:
@@ -2321,19 +2564,18 @@ class Bot(discord.Client):
 def poll_targets() -> list[tuple[str, sqlite3.Row]]:
     """Conversations that need polling.
 
-    Topic conversations never produce callbacks, so they are polled in both
-    transports. Parent groups are polled when GROUPME_MODE=poll, and also when a
-    topic bridge has no bot (without a bot, its main chat has no callbacks).
+    Topics (subgroups) never produce callbacks, so a topic bridge is always polled.
+    A main-chat bridge is polled when GROUPME_MODE=poll, and also when it has no bot
+    (without a bot there are no callbacks either).
     """
     targets: list[tuple[str, sqlite3.Row]] = []
     for bridge in list_bridges():
-        topic_id = bridge["topic_id"] or ""
-        if topic_id:
-            targets.append((str(topic_id), bridge))
-            if not bridge["bot_id"]:
-                targets.append((str(bridge["group_id"]), bridge))
-        elif GROUPME_MODE == "poll":
-            targets.append((str(bridge["group_id"]), bridge))
+        if (
+            bridge["conversation_type"] == "topic"
+            or GROUPME_MODE == "poll"
+            or not bridge["bot_id"]
+        ):
+            targets.append((str(bridge["conversation_id"]), bridge))
     return targets
 
 
@@ -2356,14 +2598,14 @@ async def poll_groupme() -> None:
 async def newest_message_id(
     session: aiohttp.ClientSession, conversation_id: str, bridge: sqlite3.Row
 ) -> str:
-    """Newest message id for a group or one of its topics, used to baseline polling."""
-    if conversation_id == str(bridge["group_id"]):
-        group = await groupme_get_group(session, conversation_id)
-        return str(((group or {}).get("messages") or {}).get("last_message_id") or "")
-    for topic in await groupme_list_subgroups(session, bridge["group_id"]):
-        if str(topic.get("id")) == conversation_id:
-            return str((topic.get("messages") or {}).get("last_message_id") or "")
-    return ""
+    """Newest message id for a group's main chat or one of its topics, for baselining."""
+    if bridge["conversation_type"] == "topic":
+        for topic in await groupme_list_subgroups(session, bridge["group_id"]):
+            if str(topic.get("id")) == str(conversation_id):
+                return str((topic.get("messages") or {}).get("last_message_id") or "")
+        return ""
+    group = await groupme_get_group(session, conversation_id)
+    return str(((group or {}).get("messages") or {}).get("last_message_id") or "")
 
 
 async def poll_conversation(

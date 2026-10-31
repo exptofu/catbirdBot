@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -11,11 +12,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bot  # noqa: E402
 
 # bridge + cursor + link round trip
-bot.save_bridge("12345678", 111, "botabc", "Test Group")
-assert bot.bridge_for_group("12345678")["channel_id"] == 111
-assert bot.bridge_for_channel(111)["bot_id"] == "botabc"
-assert bot.bridge_for_channel(999) is None
-assert [row["group_id"] for row in bot.list_bridges()] == ["12345678"]
+bot.save_bridge("12345678", 111, "botabc", "Test Group", group_name="Test Group")
+assert bot.bridge_for_conversation("12345678")["channel_id"] == 111
+assert bot.bridge_for_destination(111)["bot_id"] == "botabc"
+assert bot.bridge_for_destination(999) is None
+assert [row["conversation_id"] for row in bot.list_bridges()] == ["12345678"]
+assert bot.webhook_channel_id(bot.bridge_for_conversation("12345678")) == 111
+
+# a topic of the same group is a separate bridge with its own destination
+bot.save_bridge(
+    "99887",
+    222,
+    "",
+    "cobb",
+    conversation_type="topic",
+    group_id="12345678",
+    group_name="Test Group",
+    target_kind="thread",
+    parent_id=333,
+    send_mode="user",
+)
+topic = bot.bridge_for_conversation("99887")
+assert topic["conversation_type"] == "topic" and topic["group_id"] == "12345678"
+assert bot.conversation_label(topic) == "#cobb"
+assert bot.destination_label(topic) == "<#222> (post)"
+# the webhook for a forum post lives on the parent channel
+assert bot.webhook_channel_id(topic) == 333
+assert len(bot.bridges_for_group("12345678")) == 2
+assert bot.outbound_conversation_id(topic) == "99887"
+
+# one destination can only carry one bridge
+try:
+    bot.save_bridge("77777", 111, "", "other")
+except sqlite3.IntegrityError:
+    pass
+else:
+    raise AssertionError("channel 111 accepted a second bridge")
 
 bot.set_last_seen("12345678", "900")
 assert bot.last_seen("12345678") == "900"
@@ -25,8 +57,20 @@ assert bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 assert bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 assert not bot.link_exists("nope", "12345678", "555")
 
+# retargeting a bridge keeps the destination and the webhook
+bot.update_bridge_conversation("99887", "99888", "topic", "dekalb", "user")
+retargeted = bot.bridge_for_destination(222)
+assert retargeted["conversation_id"] == "99888", retargeted["conversation_id"]
+assert retargeted["conversation_name"] == "dekalb"
+assert retargeted["parent_id"] == 333 and retargeted["target_kind"] == "thread"
+assert bot.bridge_for_conversation("99887") is None
+
+bot.set_bridge_bot("12345678", "botxyz")
+assert bot.bridge_for_conversation("12345678")["bot_id"] == "botxyz"
+
 bot.delete_bridge("12345678")
-assert bot.bridge_for_group("12345678") is None and bot.last_seen("12345678") is None
+assert bot.bridge_for_conversation("12345678") is None and bot.last_seen("12345678") is None
+bot.delete_bridge("99888")
 
 # helpers
 assert bot.parse_group_id("https://groupme.com/join_group/12345678/AbCdEf/") == "12345678"

@@ -1,10 +1,11 @@
 """Create or update a bridge without slash commands.
 
 Creates the Discord webhook, ensures the GroupMe bot, resolves the topic if given,
-and baselines both conversations so old history is not replayed. Mirrors `/bridge add`.
+and baselines the conversation so old history is not replayed. Mirrors `/bridge add`.
 
     python utils/bridge_setup.py --group 118478056 --channel 1558263681114968215
     python utils/bridge_setup.py --group 118478056 --channel 1558263681114968215 --topic cobb
+    python utils/bridge_setup.py --group 118478056 --thread 1565911029269930024 --parent 1565911029269930020
 """
 import argparse
 import asyncio
@@ -21,13 +22,37 @@ import bot  # noqa: E402
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Create a GroupMe <-> Discord bridge")
     parser.add_argument("--group", required=True, help="GroupMe group id")
-    parser.add_argument("--channel", required=True, type=int, help="Discord channel id")
+    parser.add_argument(
+        "--channel", type=int, default=0, help="Discord text channel id (destination)"
+    )
+    parser.add_argument(
+        "--thread",
+        type=int,
+        default=0,
+        help="Discord forum post / thread id (destination); implies a thread target",
+    )
+    parser.add_argument(
+        "--parent",
+        type=int,
+        default=0,
+        help="Forum or text channel that owns the webhook (required with --thread)",
+    )
     parser.add_argument("--topic", default="", help="Topic name or id (optional)")
     parser.add_argument("--bot", default="", help="Existing GroupMe bot id (optional)")
     args = parser.parse_args()
 
-    if bot.bridge_for_channel(args.channel):
-        print(f"channel {args.channel} is already bridged; remove it first")
+    destination = args.thread or args.channel
+    if not destination:
+        print("pass --channel <id> or --thread <id> --parent <id>")
+        return 1
+    target_kind = "thread" if args.thread else "channel"
+    if target_kind == "thread" and not args.parent:
+        print("--thread needs --parent: the forum or channel that owns the webhook")
+        return 1
+    webhook_channel = args.parent or destination
+
+    if bot.bridge_for_destination(destination):
+        print(f"{destination} is already bridged; remove it first")
         return 1
 
     headers = {"Authorization": f"Bot {bot.DISCORD_TOKEN}"}
@@ -43,8 +68,10 @@ async def main() -> int:
                 print("available topics:", [(t.get("topic"), t.get("id")) for t in topics] or "none")
                 return 1
 
+        # Main-chat bridges post through a GroupMe bot; topic bridges use the access
+        # token and are polled, so they need no bot.
         bot_id = args.bot.strip()
-        if not bot_id:
+        if not topic_row and not bot_id:
             bot_id, note = await bot.ensure_group_bot(
                 groupme, args.group, await bot.fresh_bot_avatar(groupme)
             )
@@ -53,7 +80,7 @@ async def main() -> int:
                 return 1
 
         async with discord.post(
-            f"https://discord.com/api/v10/channels/{args.channel}/webhooks",
+            f"https://discord.com/api/v10/channels/{webhook_channel}/webhooks",
             json={"name": bot.WEBHOOK_NAME},
         ) as response:
             payload = await response.json()
@@ -61,34 +88,41 @@ async def main() -> int:
                 print("webhook creation failed:", payload)
                 return 1
 
+        conversation_id = str(topic_row["id"]) if topic_row else args.group
+        conversation_name = (
+            (topic_row.get("topic") or conversation_id) if topic_row else (group_name or args.group)
+        )
         bot.save_bridge(
-            args.group,
-            args.channel,
+            conversation_id,
+            destination,
             bot_id,
-            group_name,
-            int(payload["id"]),
-            payload["token"],
-            topic_id=str(topic_row["id"]) if topic_row else "",
-            topic_name=(topic_row.get("topic") or "") if topic_row else "",
+            conversation_name,
+            conversation_type="topic" if topic_row else "group",
+            group_id=args.group,
+            group_name=group_name,
+            target_kind=target_kind,
+            parent_id=args.parent or None,
+            webhook_id=int(payload["id"]),
+            webhook_token=payload["token"],
             send_mode="user" if topic_row else "bot",
         )
 
-        last = ((group or {}).get("messages") or {}).get("last_message_id")
+        source = topic_row if topic_row else group
+        last = ((source or {}).get("messages") or {}).get("last_message_id")
         if last:
-            bot.set_last_seen(args.group, str(last))
-        if topic_row:
-            topic_last = (topic_row.get("messages") or {}).get("last_message_id")
-            if topic_last:
-                bot.set_last_seen(str(topic_row["id"]), str(topic_last))
+            bot.set_last_seen(conversation_id, str(last))
 
-    bridge = bot.bridge_for_group(args.group)
+    bridge = bot.bridge_for_conversation(conversation_id)
     print(
         "bridge:",
         {
+            "conversation_id": bridge["conversation_id"],
+            "type": bridge["conversation_type"],
             "group_id": bridge["group_id"],
             "channel_id": bridge["channel_id"],
-            "bot_id": bridge["bot_id"],
-            "topic": bridge["topic_name"] or "-",
+            "target_kind": bridge["target_kind"],
+            "parent_id": bridge["parent_id"] or "-",
+            "bot_id": bridge["bot_id"] or "-",
             "send_mode": bridge["send_mode"],
         },
     )

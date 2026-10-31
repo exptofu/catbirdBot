@@ -4,9 +4,10 @@ A two-way bridge between GroupMe groups and Discord channels. Any number of Grou
 
 ## Features
 
-- **Many-to-many bridges** in one Discord server, stored in SQLite (`catbird.db`).
-- **Topic bridges**: a GroupMe group with several topics can relay its main chat *and* one chosen topic into a single channel; Discord messages are posted into that topic.
-- **Both directions**: group bridges post with a GroupMe bot; topic bridges post with the access token; GroupMe messages are posted through a per-channel Discord webhook so the original name and avatar are preserved.
+- **One-to-one bridges**: every GroupMe conversation — a group's main chat, or one of its topics — maps to exactly one Discord destination, either a text channel or a forum post. Bridges live in SQLite (`catbird.db`).
+- **Destination-aware commands**: `/bridge add` looks at where you ran it. In a text channel the channel is the destination, in a forum channel the bot creates a post, and inside a post or thread that post is the destination.
+- **Forum posts** behave like any other destination: GroupMe messages arrive through the webhook that lives on the forum channel, and an archived post is unarchived automatically before the next message.
+- **Both directions**: main-chat bridges post with a GroupMe bot; topic bridges post with the access token; GroupMe messages are posted through a per-channel Discord webhook so the original name and avatar are preserved.
 - **Photos**: GroupMe images are downloaded and re-uploaded as Discord attachments; Discord images are downloaded, compressed, and re-hosted on GroupMe's image service for both group and topic bridges. GroupMe rejects non-GroupMe image URLs (`invalid origin`), so an image that cannot be re-hosted is skipped and the message notes how many were dropped.
 - **No bot echo**: bot messages are skipped on both sides, and topic posts are tracked so they are not mirrored back.
 
@@ -98,27 +99,29 @@ All commands require the **Administrator** permission (enforced both by Discord'
 
 | Command | Purpose |
 | --- | --- |
-| `/bridge add group_id channel [bot_id] [topic]` | Create a bridge, create the channel webhook, and baseline the conversation so old history is not replayed. Accepts a group id or a `groupme.com` join link. With `GROUPME_ACCESS_TOKEN` set, `bot_id` is optional: the bot is created for that group automatically (or the existing one is reused when the callback URL is already registered). `topic` (a topic name or id) creates a topic bridge instead. Re-running it for an already bridged group updates that bridge. |
+| `/bridge add group_id [topic] [bot_id]` | Bridge the conversation into wherever the command was run: a text channel, a forum channel (a post is created), or an existing post/thread. Accepts a group id or a `groupme.com` join link. `topic` (name or id) mirrors that topic instead of the main chat. `bot_id` is optional when `GROUPME_ACCESS_TOKEN` is set: a bot is created or reused for main-chat bridges and ignored for topic bridges. The cursor is baselined so old history is not replayed. |
 | `/bridge topics group_id` | List the group's topics with their ids and message counts. |
-| `/bridge set-topic group_id topic` | Point an existing bridge at a topic, or pass `none` to go back to the main chat. |
-| `/bridge list` | Show every group/topic, channel, and poster pairing. |
-| `/bridge remove group_id` | Delete the bridge, its webhook, and its message links. |
-| `/bridge set-bot group_id bot_id` | Point an existing group bridge at a different GroupMe bot. |
-| `/bridge set-avatar group_id [image_url]` | Give the group's bot a profile picture. GroupMe has no bot update endpoint, so the bot is deleted and recreated with the avatar (new bot id). Defaults to the Discord bot's own avatar. |
-| `/bridge test group_id` | Post one test message in each direction. |
+| `/bridge set-topic topic` | Point the bridge on this channel/post at another GroupMe topic, or pass `none` to mirror the group's main chat instead. |
+| `/bridge list` | Show every bridge: GroupMe conversation, Discord destination, and poster. |
+| `/bridge remove` | Delete the bridge on this channel/post, its webhook, and its message links. |
+| `/bridge set-bot bot_id` | Point a main-chat bridge at a different GroupMe bot. |
+| `/bridge set-avatar [image_url]` | Give the bridge's bot a profile picture. GroupMe has no bot update endpoint, so the bot is deleted and recreated with the avatar (new bot id). Defaults to the Discord bot's own avatar. |
+| `/bridge test` | Post one test message in each direction for the bridge on this channel/post. |
+
+Only `/bridge add` (which takes a `group_id`) and `/bridge topics` take a GroupMe id: every other command acts on the channel or post it is run in.
 
 Slash commands sync globally on startup. Set `DISCORD_GUILD_ID` to sync to a single guild instead, which is instant.
 
 ## GroupMe topics
 
-A GroupMe **topic** is a subgroup with its own message stream, its own id, and no bot support. A topic bridge is therefore asymmetric:
+A GroupMe **topic** is a subgroup with its own message stream, its own id, and no bot support. Topics are bridged one-to-one, independently of the group's main chat:
 
-- **GroupMe → Discord**: the group's main chat (via bot callbacks) and the mapped topic (via polling) both relay into the same channel. Other topics are ignored.
-- **Discord → GroupMe**: messages are posted into the mapped topic with `GROUPME_ACCESS_TOKEN`, so they appear as the authenticated GroupMe account rather than a bot. Images are uploaded to `image.groupme.com` first so they render inline.
+- **GroupMe → Discord**: only the mapped conversation relays, never both. A topic bridge polls its own topic; a main-chat bridge gets bot callbacks, or polls in `GROUPME_MODE=poll`.
+- **Discord → GroupMe**: a main-chat bridge posts with the group's bot; a topic bridge posts into the topic with `GROUPME_ACCESS_TOKEN`, so it appears as the authenticated GroupMe account. Images are uploaded to `image.groupme.com` first so they render inline.
 
-`POST /groups/{id}/messages` is the only way to write into a topic; creating a bot for a subgroup returns `401`, and topic messages never trigger bot callbacks, which is why they are polled.
+One group can therefore have two bridges at the same time — the main chat in one channel and `#cobb` in a forum post — but each conversation has exactly one Discord destination and each destination carries exactly one bridge. `bridges.conversation_id` is the primary key, `bridges.channel_id` is unique, and `/bridge add` refuses a conversation or a destination that is already taken.
 
-A topic bridge still gets a bot on the **parent** group — it never posts with it, but that bot is what makes the group's main chat arrive by callback. If no bot can be created (or one was removed later), the bot falls back to polling the parent group, so main-chat messages still arrive, just on the `GROUPME_POLL_SECONDS` cadence.
+`POST /groups/{id}/messages` is the only way to write into a topic; creating a bot for a subgroup returns `401`, and topic messages never trigger bot callbacks, which is why they are polled. A topic bridge needs no GroupMe bot at all.
 
 ### Bot avatars
 
@@ -126,7 +129,40 @@ GroupMe bots support a `bot[avatar_url]`, but **only** when it points at `i.grou
 
 Avatars are never shared between bots or reused across restarts: GroupMe deletes the hosted image when a bot that used it is removed, so a pinned URL silently starts returning `403 AccessDenied`. GroupMe also exposes no bot update call, so changing an avatar recreates the bot — `/bridge set-avatar` does that and stores the new bot id.
 
-A GroupMe group without topics keeps the plain 1:1 mapping: `/bridge add group_id channel bot_id` with no `topic`.
+
+## Migrating to a new GroupMe account
+
+Only two things are tied to a GroupMe account:
+
+| Thing | Where | Consequence |
+| --- | --- | --- |
+| `GROUPME_ACCESS_TOKEN` | `.env` (and `/opt/catbirdBot/.env` when deployed) | Polling, group and topic lookups, image uploads, and topic posts all run as this account |
+| GroupMe bots (`bridges.bot_id`) | created by `POST /bots` | `GET /bots` only lists bots owned by the token; a bot id from another account makes `/bots/post` answer `404` |
+
+`catbird.db` holds no account or user ids, so a new token needs no export/import and the poll cursors keep working (history is not replayed). Note that bumping `SCHEMA_VERSION` rebuilds the bridge tables, so existing bridges then have to be re-created with `/bridge add`.
+
+1. **Create the account and join every bridged group.** GroupMe allows one account per phone number, so use a dedicated email and phone. `/groups`, `/groups/{id}/subgroups`, bot creation, and topic posts all fail for groups the account is not a member of.
+2. **Copy the new token** while logged in as the new account: <https://dev.groupme.com/applications> → Access Token.
+3. **Delete the old bots, still using the old token.** Bots cannot change owner, and GroupMe rejects a new bot whose callback URL is *"already registered for the group"*. The fallback in `ensure_group_bot` then looks the bot up through `GET /bots`, which only lists the new account's bots, leaving the bridge with no bot at all.
+
+   ```powershell
+   python utils/bot_admin.py list
+   python utils/groupme_setup.py delete-bot --bot-id <bot_id>   # one per bridged group
+   ```
+
+   If the old token is already gone, leave `GROUPME_PUBLIC_URL` and `NGROK_DOMAIN` empty in `poll` mode instead: a bot without a callback URL does not collide with the old one.
+4. **Swap `GROUPME_ACCESS_TOKEN`** in the local `.env` and in `/opt/catbirdBot/.env` (`sudo chmod 600`), then restart the service. Never commit the token.
+5. **Check membership before recreating bots:** `python utils/groupme_setup.py groups` must list every group from `/bridge list`, or the poller logs `GroupMe poll failed` for the missing ones.
+6. **Recreate the bots** — this creates them under the new account and stores the new ids in the bridge, reusing `GROUPME_BOT_NAME` and the configured avatar and callback:
+
+   ```powershell
+   python utils/bot_admin.py ensure --group <group_id>   # per bridged group
+   ```
+
+   Re-running `/bridge add group_id channel [topic]` for the same group and channel also updates the bridge, but it creates a fresh Discord webhook each time, so `bot_admin.py ensure` is the tidier route.
+7. **Restart and verify.** `refresh_bot_names()` rebuilds `BOT_NAMES` from the new token at startup. Run `/bridge test group_id` and watch `journalctl -u catbird-bot -f` for `404`/`403` responses.
+
+Visible effects: topic bridges (`send_mode='user'`) now post as the new account, including its name and avatar; group bridges still post through the bot, so only the bot's owning account changes. Keep the new account in the groups permanently — removing it breaks polling, topic relay, and image upload even though the bots keep firing callbacks. The old account can leave the groups after the new bots post successfully, but keep it alive until then, because its token is the only way to delete its bots.
 
 
 ## Edits
@@ -137,12 +173,13 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 
 - GroupMe text is capped at 1,000 characters. Longer Discord messages are truncated and, when possible, keep their trailing links.
 - Discord replies are relayed with a quoted snippet. Every Discord message starts with `Nickname:` (including picture-only posts, which are separate bot messages), so GroupMe members can see who typed. User and role mentions become `@Name` and channel mentions become `#name`, because GroupMe does not render Discord markup. Emoji are stripped: custom Discord emoji have no GroupMe equivalent and unicode emoji are not relayed.
-- GroupMe messages keep the sender's name and avatar through the channel webhook. Messages relayed from a topic are prefixed with `#topic:` (e.g. `#cobb: hey`) so a single channel can carry the main chat and the mapped topic; main-chat messages are unprefixed. The Discord → GroupMe direction is delineated the same way, with `Nickname:` leading every message.
+- GroupMe messages keep the sender's name and avatar through the channel webhook, and their text is relayed exactly as sent: since every destination mirrors a single conversation, no channel or topic prefix is added. The Discord → GroupMe direction is delineated with `Nickname:` leading every message.
+- Forum posts and threads have no webhook of their own: the bridge creates the webhook on the parent forum/text channel and passes the thread id when posting. An archived post is unarchived before the message is sent.
 - GroupMe messages are mirrored with `AllowedMentions.none()`, so `@everyone` in GroupMe cannot ping Discord.
 - Bot filtering: Discord messages with `author.bot` or a `webhook_id` are skipped (the bridge's own webhooks included). GroupMe messages with `system: true`, `sender_type` other than `user`, no `user_id`, or a name matching a bot owned by the access token are skipped, so give each bridge bot a distinctive name.
 - Topic posts are made with the access token, so they come back from the API as ordinary user messages; the bridge stores their ids and never mirrors them back into Discord.
 - GroupMe answers `404` on `/bots/post` when a bot id no longer exists (deleted, recreated, or copied from another account). The bridge treats that as a stale mapping: it looks up the group's bot (creating one with the configured name, avatar, and callback if needed), saves the new id, and retries the post once.
-- The poller makes one request per polled conversation per cycle (topics always, groups only in `poll` mode). GroupMe rate limits per token, so raise `GROUPME_POLL_SECONDS` when bridging many conversations.
+- The poller makes one request per polled conversation per cycle (topics always, main chats only in `poll` mode or when the bridge has no bot). GroupMe rate limits per token, so raise `GROUPME_POLL_SECONDS` when bridging many conversations.
 - The first poll for a conversation baselines at its newest message; history is never replayed.
 - Every image sent to GroupMe is compressed: downscaled to `IMAGE_MAX_DIMENSION` (default 2048 px) and re-encoded as JPEG at `IMAGE_JPEG_QUALITY` (default 85), lowering quality until it fits `IMAGE_UPLOAD_LIMIT_BYTES` (default 8 MiB), then re-hosted on `image.groupme.com`. Animated GIFs are kept untouched (re-encoding would drop frames) and are skipped if they exceed the budget. Originals above `IMAGE_SOURCE_LIMIT_BYTES` (32 MiB) are dropped.
 - GroupMe validates the `picture_url` origin: a Discord CDN link or any other non-`i.groupme.com` host returns `400 ... has invalid origin`. That is why images are always downloaded and re-hosted rather than passed through, and why `GROUPME_ACCESS_TOKEN` is effectively required for image relay.

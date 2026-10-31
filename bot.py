@@ -602,32 +602,72 @@ async def groupme_destroy_bot(session: aiohttp.ClientSession, bot_id: str) -> No
     await groupme_request(session, "POST", "/bots/destroy", form={"bot_id": str(bot_id)})
 
 
+async def groupme_create_bot_with_fallback(
+    session: aiohttp.ClientSession, group_id: str, avatar_url: str = ""
+) -> dict:
+    """Create a bot, retrying without the avatar when GroupMe refuses it.
+
+    GroupMe silently accepts the form but can reject `bot[avatar_url]` outright; the
+    retry keeps a bad avatar from blocking the bridge. Raises the last `GroupMeError`.
+    """
+    attempts = [avatar_url, ""] if avatar_url else [""]
+    last_error: GroupMeError | None = None
+    for avatar in attempts:
+        try:
+            created = await groupme_create_bot(
+                session, group_id, GROUPME_BOT_NAME, callback_url(), avatar
+            )
+        except GroupMeError as error:
+            message = str(error).lower()
+            if error.status == 400 and "already registered" in message:
+                raise
+            log.warning(
+                "GroupMe rejected bot creation for group %s (avatar=%s): %s",
+                group_id,
+                bool(avatar),
+                error,
+            )
+            last_error = error
+            continue
+        if str(created.get("bot_id") or ""):
+            return created
+        last_error = GroupMeError("GroupMe returned no bot id")
+    raise last_error or GroupMeError("bot creation failed")
+
+
 async def ensure_group_bot(
     session: aiohttp.ClientSession, group_id: str, avatar_url: str = ""
 ) -> tuple[str, str]:
     """Create or reuse a bot for a group. Returns (bot_id, note); id is "" on failure."""
+    failure = ""
     try:
-        created = await groupme_create_bot(
-            session, group_id, GROUPME_BOT_NAME, callback_url(), avatar_url
-        )
-        bot_id = str(created.get("bot_id") or "")
-        if bot_id:
-            return bot_id, f"Created GroupMe bot **{GROUPME_BOT_NAME}** (`{bot_id}`)."
-        return "", "GroupMe returned no bot id."
+        created = await groupme_create_bot_with_fallback(session, group_id, avatar_url)
     except GroupMeError as error:
-        if not (error.status == 400 and "already registered" in str(error).lower()):
-            return "", f"GroupMe rejected the bot request: `{error}`."
+        failure = f"GroupMe rejected the bot request: `{error}`."
+    else:
+        bot_id = str(created.get("bot_id") or "")
+        note = f"Created GroupMe bot **{GROUPME_BOT_NAME}** (`{bot_id}`)."
+        if avatar_url and not created.get("avatar_url"):
+            note += " GroupMe ignored the bot avatar."
+        return bot_id, note
+
+    # Creation failed: a bot may already exist for this group (same callback, a
+    # different app, or a per-group limit), and reusing it still beats no bridge.
     try:
         existing = await groupme_find_bot(session, group_id, callback_url())
     except GroupMeError:
         existing = None
     bot_id = str((existing or {}).get("bot_id") or "")
-    if bot_id:
-        return bot_id, f"Reusing the existing GroupMe bot `{bot_id}` for this group."
-    return "", (
-        "GroupMe says this callback URL is already registered for the group, but no "
-        "matching bot could be listed."
-    )
+    if not bot_id:
+        return "", f"{failure} No existing bot for this group could be listed either."
+
+    note = f"Reusing the existing GroupMe bot `{bot_id}` for this group ({failure})"
+    if callback_url() and existing.get("callback_url") and existing["callback_url"] != callback_url():
+        note += (
+            "\n⚠️ That bot posts to a different callback URL, so GroupMe messages may not "
+            f"arrive; point it at `{callback_url()}` or run `/bridge set-bot`."
+        )
+    return bot_id, note
 
 
 async def groupme_post_bot(
@@ -1057,12 +1097,8 @@ async def recover_bot_id(
     existing = await groupme_find_bot(session, group_id, callback_url())
     bot_id = str((existing or {}).get("bot_id") or "")
     if not bot_id:
-        created = await groupme_create_bot(
-            session,
-            group_id,
-            GROUPME_BOT_NAME,
-            callback_url(),
-            await fresh_bot_avatar(session, client),
+        created = await groupme_create_bot_with_fallback(
+            session, group_id, await fresh_bot_avatar(session, client)
         )
         bot_id = str(created.get("bot_id") or "")
     if not bot_id:
@@ -1559,8 +1595,11 @@ async def bridge_add(
                     embed=discord.Embed(
                         title="❌ Bot creation failed",
                         description=(
-                            "GroupMe did not return a usable bot for this group. Create one with "
-                            "`utils/groupme_setup.py` and pass its `bot_id`."
+                            f"{note}\n\n"
+                            "Pass an existing `bot_id`, or create one with "
+                            f"`python utils/groupme_setup.py create-bot --group-id {group_id} "
+                            f"--callback-url {callback_url() or 'https://<your-host>' + GROUPME_WEBHOOK_PATH}` "
+                            "and run the command again."
                         ),
                         color=discord.Color.red(),
                     ),
@@ -1807,7 +1846,7 @@ async def bridge_set_topic(interaction: discord.Interaction, topic: str):
         bot_id = bridge["bot_id"]
         if not bot_id:
             # The main chat is posted through a GroupMe bot, so make sure one exists.
-            bot_id, _note = await ensure_group_bot(
+            bot_id, note = await ensure_group_bot(
                 session, group_id, await fresh_bot_avatar(session, interaction.client)
             )
             if not bot_id:
@@ -1815,8 +1854,8 @@ async def bridge_set_topic(interaction: discord.Interaction, topic: str):
                     embed=discord.Embed(
                         title="❌ No GroupMe bot",
                         description=(
-                            "The main chat is posted through a GroupMe bot and one could not be "
-                            "created. Run `utils/groupme_setup.py`, then `/bridge set-bot`."
+                            f"{note}\n\nThe main chat is posted through a GroupMe bot. Create "
+                            "one with `utils/groupme_setup.py`, then run `/bridge set-bot`."
                         ),
                         color=discord.Color.red(),
                     ),

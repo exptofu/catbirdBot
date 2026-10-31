@@ -53,6 +53,16 @@ async def bot_post(request):
 async def bots_create(request):
     form = dict(await request.post())
     CREATED_BOTS.append(form)
+    if form.get("bot[group_id]") == "NOAVATAR" and form.get("bot[avatar_url]"):
+        return web.json_response(
+            {"meta": {"code": 400, "errors": ["avatar_url: invalid origin"]}, "response": None},
+            status=400,
+        )
+    if form.get("bot[group_id]") == "MAXBOTS":
+        return web.json_response(
+            {"meta": {"code": 400, "errors": ["group has too many bots"]}, "response": None},
+            status=400,
+        )
     return web.json_response(
         {
             "response": {
@@ -74,6 +84,7 @@ async def bots_list(request):
             "response": [
                 {"bot_id": "old-bot", "group_id": "G1", "name": "Catbird Bridge", "callback_url": "https://old.example"},
                 {"bot_id": "new-bot-id", "group_id": "G1", "name": "Catbird Bridge", "callback_url": "https://new.example"},
+                {"bot_id": "max-bot", "group_id": "MAXBOTS", "name": "Catbird Bridge", "callback_url": "https://elsewhere.example"},
             ]
         }
     )
@@ -231,6 +242,23 @@ async def main():
         assert await bot.groupme_find_bot(session, "OTHER") is None
         await bot.groupme_destroy_bot(session, "new-bot-id")
         assert CREATED_BOTS[-1] == {"destroyed": "new-bot-id"}, CREATED_BOTS[-1]
+
+        # a refused avatar is retried without one instead of failing the bridge
+        CREATED_BOTS.clear()
+        bot_id, note = await bot.ensure_group_bot(
+            session, "NOAVATAR", "https://i.groupme.com/x.png"
+        )
+        assert bot_id == "new-bot-id", (bot_id, note)
+        assert len(CREATED_BOTS) == 2, CREATED_BOTS
+        assert CREATED_BOTS[0]["bot[avatar_url]"] == "https://i.groupme.com/x.png"
+        assert "bot[avatar_url]" not in CREATED_BOTS[1], CREATED_BOTS[1]
+
+        # a group whose bot creation fails reuses the bot the account already has,
+        # and the note carries GroupMe's reason instead of a generic message
+        CREATED_BOTS.clear()
+        bot_id, note = await bot.ensure_group_bot(session, "MAXBOTS")
+        assert bot_id == "max-bot", (bot_id, note)
+        assert "too many bots" in note, note
 
         topics = await bot.groupme_list_subgroups(session, "G1")
         assert [t["topic"] for t in topics] == ["cobb", "dekalb"]

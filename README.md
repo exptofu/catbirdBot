@@ -184,6 +184,7 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 - The poller makes one request per polled conversation per cycle (topics always, main chats only in `poll` mode or when the bridge has no bot). GroupMe rate limits per token, so raise `GROUPME_POLL_SECONDS` when bridging many conversations.
 - The first poll for a conversation baselines at its newest message; history is never replayed.
 - Every image sent to GroupMe is compressed: downscaled to `IMAGE_MAX_DIMENSION` (default 2048 px) and re-encoded as JPEG at `IMAGE_JPEG_QUALITY` (default 85), lowering quality until it fits `IMAGE_UPLOAD_LIMIT_BYTES` (default 8 MiB), then re-hosted on `image.groupme.com`. Animated GIFs are kept untouched (re-encoding would drop frames) and are skipped if they exceed the budget. Originals above `IMAGE_SOURCE_LIMIT_BYTES` (32 MiB) are dropped.
+- `/bridge add` creates a GroupMe bot for main-chat bridges. When GroupMe refuses the request (a refused `avatar_url`, a per-group bot limit, a callback URL already registered for the group), the bot is retried without its avatar and the bridge falls back to any bot the account already has for that group; either way the reply quotes GroupMe's own error instead of a generic message.
 - GroupMe validates the `picture_url` origin: a Discord CDN link or any other non-`i.groupme.com` host returns `400 ... has invalid origin`. That is why images are always downloaded and re-hosted rather than passed through, and why `GROUPME_ACCESS_TOKEN` is effectively required for image relay.
 
 ## Files
@@ -196,6 +197,7 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 | `utils/bot_admin.py` | Bot maintenance: `list` (with avatar reachability), `ensure`, `repair`, `resync-avatars`. |
 | `utils/sync_env.py` | Rebuilds `.env` from `.env.example` while preserving existing values. |
 | `utils/inspect_payloads.py` | Summarizes captured GroupMe callbacks (`groupme_payloads.jsonl`). |
+| `utils/check_commands.py` | Compares the slash commands registered in Discord with the ones in `bot.py`; `--fix` deletes a stale global command set. |
 | `tests/smoke.py` | Fast checks for DB helpers, rendering, and topic matching. |
 | `tests/integration.py` | Offline end-to-end run against a fake GroupMe API (relays, images, bot recovery). |
 | `deploy/catbird-bot.service` | systemd unit that runs the bot from `/opt/catbirdBot` as the `catbird` user. |

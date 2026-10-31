@@ -84,7 +84,10 @@ IMAGE_JPEG_QUALITY = min(95, max(50, int(os.environ.get("IMAGE_JPEG_QUALITY", "8
 IMAGE_SOURCE_LIMIT_BYTES = max(IMAGE_UPLOAD_LIMIT_BYTES * 8, 32 * 1024 * 1024)
 WEBHOOK_NAME = "GroupMe Bridge"
 GROUPME_BOT_NAME = os.environ.get("GROUPME_BOT_NAME", "Catbird Bridge").strip() or "Catbird Bridge"
+# Local image file (relative to bot.py) used as the bot avatar; falls back to this URL.
+GROUPME_BOT_AVATAR_PATH = os.environ.get("GROUPME_BOT_AVATAR_PATH", "").strip()
 GROUPME_BOT_AVATAR_URL = os.environ.get("GROUPME_BOT_AVATAR_URL", "").strip()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LINK_GROUPME = "groupme_to_discord"
 IMAGE_TYPES = {
     "image/jpeg": "jpg",
@@ -908,7 +911,10 @@ def groupme_content_for_discord(
 
 
 async def relay_discord_message(
-    session: aiohttp.ClientSession, message: discord.Message, bridge: sqlite3.Row
+    session: aiohttp.ClientSession,
+    message: discord.Message,
+    bridge: sqlite3.Row,
+    client=None,
 ) -> None:
     name = message.author.display_name or message.author.name
     text = render_discord_content(message)
@@ -955,7 +961,7 @@ async def relay_discord_message(
             await groupme_post_bot(session, bot_id, body)
         except GroupMeError as error:
             # GroupMe answers 404 when the bot id no longer exists (deleted, recreated,
-            # or copied from another account). Repair the bridge and post once more.
+            # or copied from another account). Repair the, client bridge and post once more.
             if error.status != 404:
                 raise
             bot_id = await recover_bot_id(session, bridge)
@@ -973,14 +979,20 @@ async def relay_discord_message(
     )
 
 
-async def recover_bot_id(session: aiohttp.ClientSession, bridge: sqlite3.Row) -> str:
+async def recover_bot_id(
+    session: aiohttp.ClientSession, bridge: sqlite3.Row, client=None
+) -> str:
     """Find or create a working bot for the bridge's group and store it."""
     group_id = bridge["group_id"]
     existing = await groupme_find_bot(session, group_id, callback_url())
     bot_id = str((existing or {}).get("bot_id") or "")
     if not bot_id:
         created = await groupme_create_bot(
-            session, group_id, GROUPME_BOT_NAME, callback_url(), GROUPME_BOT_AVATAR_URL
+            session,
+            group_id,
+            GROUPME_BOT_NAME,
+            callback_url(),
+            await fresh_bot_avatar(session, client),
         )
         bot_id = str(created.get("bot_id") or "")
     if not bot_id:
@@ -1017,6 +1029,76 @@ async def host_image_for_groupme(
     except GroupMeError:
         log.exception("GroupMe image upload failed for %s", attachment.filename)
         return None
+
+
+def read_avatar_file(path: str) -> tuple[bytes, str] | None:
+    """Read the configured local avatar image, resolved relative to bot.py."""
+    full_path = path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
+    try:
+        with open(full_path, "rb") as handle:
+            data = handle.read(IMAGE_SOURCE_LIMIT_BYTES + 1)
+    except OSError:
+        log.warning("GROUPME_BOT_AVATAR_PATH %s could not be read", full_path)
+        return None
+    if not data:
+        log.warning("GROUPME_BOT_AVATAR_PATH %s is empty", full_path)
+        return None
+    if len(data) > IMAGE_SOURCE_LIMIT_BYTES:
+        log.warning("GROUPME_BOT_AVATAR_PATH %s is larger than %d bytes", full_path, IMAGE_SOURCE_LIMIT_BYTES)
+        return None
+    suffix = os.path.splitext(full_path)[1].lower()
+    content_type = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }.get(suffix, "image/jpeg")
+    return data, content_type
+
+
+async def fresh_bot_avatar(session: aiohttp.ClientSession, client=None) -> str:
+    """Upload a brand new copy of the bot avatar and return its i.groupme.com URL.
+
+    GroupMe deletes a hosted image when a bot using it is destroyed, so avatars are
+    never shared: each bot creation uploads its own copy. Sources in priority order:
+    `GROUPME_BOT_AVATAR_PATH` (a file in the repo), `GROUPME_BOT_AVATAR_URL`, and
+    finally the Discord bot's own picture.
+    """
+    if not GROUPME_ACCESS_TOKEN:
+        return ""
+
+    if GROUPME_BOT_AVATAR_PATH:
+        local = read_avatar_file(GROUPME_BOT_AVATAR_PATH)
+        if local is not None:
+            data, content_type = local
+            try:
+                return await groupme_upload_image(session, data, content_type)
+            except GroupMeError:
+                log.exception("Could not upload the local bot avatar")
+
+    sources: list[str] = []
+    if GROUPME_BOT_AVATAR_URL:
+        sources.append(GROUPME_BOT_AVATAR_URL)
+    if client is not None and getattr(client, "user", None) is not None:
+        sources.append(client.user.display_avatar.with_size(256).url)
+
+    for url in sources:
+        try:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status != 200:
+                    log.warning("Avatar source %s returned %s", url, response.status)
+                    continue
+                data = await read_body_limited(response, IMAGE_SOURCE_LIMIT_BYTES)
+                content_type = response.content_type or "image/png"
+            if not data:
+                continue
+            return await groupme_upload_image(session, data, content_type)
+        except (aiohttp.ClientError, GroupMeError, asyncio.TimeoutError):
+            log.exception("Could not re-host avatar %s", url)
+    return ""
 
 
 async def send_to_topic(
@@ -1291,7 +1373,7 @@ async def bridge_add(
         # Every bridge needs a bot: group bridges post with it, and topic bridges need
         # one so the group's main chat arrives through callbacks.
         resolved, note = await ensure_group_bot(
-            session, group_id, await interaction.client.bot_avatar_url()
+            session, group_id, await fresh_bot_avatar(session, interaction.client)
         )
         if note:
             warnings.append(note)
@@ -1750,7 +1832,7 @@ async def bridge_set_avatar(
         avatar = (
             await client.host_avatar(image_url.strip())
             if image_url.strip()
-            else await client.bot_avatar_url()
+            else await fresh_bot_avatar(session, client)
         )
     except (GroupMeError, aiohttp.ClientError) as error:
         await interaction.followup.send(
@@ -1766,7 +1848,7 @@ async def bridge_set_avatar(
         await interaction.followup.send(
             embed=discord.Embed(
                 title="⚠️ No avatar available",
-                description="Pass an `image_url` or set `GROUPME_BOT_AVATAR_URL`.",
+                description="Pass an `image_url`, set `GROUPME_BOT_AVATAR_PATH`, or leave both empty to use the Discord avatar.",
                 color=discord.Color.orange(),
             ),
             ephemeral=True,
@@ -1919,7 +2001,6 @@ class Bot(discord.Client):
         self.web_runner: web.AppRunner | None = None
         self.ngrok_listener = None
         self.webhooks: dict[int, discord.Webhook] = {}
-        self.bot_avatar: str | None = None
 
     # -- lifecycle --------------------------------------------------------- #
 
@@ -2074,27 +2155,6 @@ class Bot(discord.Client):
         if not data:
             raise GroupMeError(f"{url} returned an empty or oversized body")
         return await groupme_upload_image(self.groupme_session, data, content_type)
-
-    async def bot_avatar_url(self) -> str:
-        """Avatar for newly created GroupMe bots: env override, else this bot's picture."""
-        if self.bot_avatar is not None:
-            return self.bot_avatar
-        if GROUPME_BOT_AVATAR_URL:
-            self.bot_avatar = GROUPME_BOT_AVATAR_URL
-            if "i.groupme.com" not in GROUPME_BOT_AVATAR_URL:
-                log.warning(
-                    "GROUPME_BOT_AVATAR_URL is not an i.groupme.com URL; GroupMe will ignore it"
-                )
-            return self.bot_avatar
-        if self.user is None or not GROUPME_ACCESS_TOKEN:
-            return ""
-        try:
-            self.bot_avatar = await self.host_avatar(self.user.display_avatar.with_size(256).url)
-            log.info("GroupMe bots will use the Discord avatar %s", self.bot_avatar)
-        except (GroupMeError, aiohttp.ClientError):
-            log.exception("Could not prepare a GroupMe bot avatar")
-            self.bot_avatar = ""
-        return self.bot_avatar
 
     async def refresh_bot_names(self) -> None:
         """Cache bot names so bot-authored messages are never mirrored back."""
@@ -2253,7 +2313,7 @@ class Bot(discord.Client):
         if bridge is None:
             return
         try:
-            await relay_discord_message(self.groupme_session, message, bridge)
+            await relay_discord_message(self.groupme_session, message, bridge, self)
         except (GroupMeError, discord.HTTPException):
             log.exception("Could not relay Discord message %s to GroupMe", message.id)
 

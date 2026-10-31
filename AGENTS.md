@@ -13,4 +13,4 @@
 - Webhook mode can expose the aiohttp callback server through the `ngrok` SDK (`NGROK_ENABLED`, `NGROK_DOMAIN`, `NGROK_AUTHTOKEN`). The tunnel URL replaces `PUBLIC_BASE_URL` at startup and must stay in sync with what `/bridge add` prints.
 - Preserve GroupMe request pacing/retries in `groupme_request` (429 + 5xx backoff, 304 means "no new messages").
 - Dependencies belong in `requirements.txt`. Avoid adding a dependency for behavior the standard library already handles.
-- There is no test suite yet. For Python edits, run `python -m py_compile bot.py utils/groupme_setup.py` and add or run a focused behavior check when practical.
+- Reusable scripts live in `utils/` (setup, bridge creation, bot maintenance, env sync, payload inspection) and checks in `tests/`. For Python edits run `python -m py_compile bot.py utils\*.py tests\*.py`, then `python tests\smoke.py` and `python tests\integration.py` (the integration test runs against a local fake GroupMe API on port 8731 and a temp database).

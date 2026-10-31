@@ -92,7 +92,9 @@ A topic bridge still gets a bot on the **parent** group — it never posts with 
 
 ### Bot avatars
 
-GroupMe bots support a `bot[avatar_url]`, but **only** when it points at `i.groupme.com`; any other origin is silently dropped (`avatar_url: null`). Bots created by `/bridge add` therefore get the Discord bot's own avatar, downloaded and re-hosted on GroupMe's image service automatically (override with `GROUPME_BOT_AVATAR_URL`, or pass `image_url` to `/bridge set-avatar`). GroupMe exposes no bot update call, so changing an avatar recreates the bot — `/bridge set-avatar` does that and stores the new bot id.
+GroupMe bots support a `bot[avatar_url]`, but **only** when it points at `i.groupme.com`; any other origin is silently dropped (`avatar_url: null`). Point `GROUPME_BOT_AVATAR_PATH` at an image in the repo (e.g. `avatar.png`) and the bot uploads a fresh copy for every bot it creates; if that is empty it falls back to `GROUPME_BOT_AVATAR_URL`, then to the Discord bot's own picture.
+
+Avatars are never shared between bots or reused across restarts: GroupMe deletes the hosted image when a bot that used it is removed, so a pinned URL silently starts returning `403 AccessDenied`. GroupMe also exposes no bot update call, so changing an avatar recreates the bot — `/bridge set-avatar` does that and stores the new bot id.
 
 A GroupMe group without topics keeps the plain 1:1 mapping: `/bridge add group_id channel bot_id` with no `topic`.
 
@@ -120,5 +122,21 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 | Path | Purpose |
 | --- | --- |
 | `bot.py` | The bridge: Discord client, GroupMe API client, relays, and slash commands. |
-| `utils/groupme_setup.py` | Lists groups/bots and creates or updates the GroupMe bot. |
+| `utils/groupme_setup.py` | Lists GroupMe groups/bots, creates or updates a bot, sets callbacks. |
+| `utils/bridge_setup.py` | Creates a bridge without slash commands (webhook, bot, topic, baselines). |
+| `utils/bot_admin.py` | Bot maintenance: `list` (with avatar reachability), `ensure`, `repair`, `resync-avatars`. |
+| `utils/sync_env.py` | Rebuilds `.env` from `.env.example` while preserving existing values. |
+| `utils/inspect_payloads.py` | Summarizes captured GroupMe callbacks (`groupme_payloads.jsonl`). |
+| `tests/smoke.py` | Fast checks for DB helpers, rendering, and topic matching. |
+| `tests/integration.py` | Offline end-to-end run against a fake GroupMe API (relays, images, bot recovery). |
 | `catbird.db` | SQLite store for bridges, poll cursors, and message links. Safe to delete only when every bridge can be recreated. |
+
+Run the checks with:
+
+```powershell
+python -m py_compile bot.py utils\*.py tests\*.py
+python tests\smoke.py
+python tests\integration.py
+```
+
+The integration test starts its own fake GroupMe API on `127.0.0.1:8731` and uses a temporary database, so it never touches the live bridge.

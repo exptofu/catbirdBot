@@ -1216,6 +1216,17 @@ def parse_group_id(value: str) -> str:
     return match.group(1) if match else value
 
 
+def describe_commands(tree: app_commands.CommandTree) -> str:
+    """List the slash commands this process publishes, for the startup log."""
+    names: list[str] = []
+    for command in tree.get_commands():
+        if isinstance(command, app_commands.Group):
+            names.extend(f"{command.name} {child.name}" for child in command.commands)
+        else:
+            names.append(command.name)
+    return ", ".join(sorted(names)) or "none"
+
+
 def callback_url() -> str:
     """Public callback URL, usable even before the tunnel starts (e.g. from scripts)."""
     base = PUBLIC_BASE_URL or (f"https://{NGROK_DOMAIN}" if NGROK_DOMAIN else "")
@@ -2296,16 +2307,55 @@ class Bot(discord.Client):
     async def sync_commands(self) -> None:
         try:
             if DISCORD_GUILD_ID:
+                await self.purge_global_commands()
                 guild = discord.Object(id=int(DISCORD_GUILD_ID))
                 self.tree.copy_global_to(guild=guild)
                 await self.tree.sync(guild=guild)
-                log.info("Application commands synced to guild %s", DISCORD_GUILD_ID)
+                log.info(
+                    "Application commands synced to guild %s (%s)",
+                    DISCORD_GUILD_ID,
+                    describe_commands(self.tree),
+                )
             else:
                 await self.tree.sync()
-                log.info("Global application commands synced")
+                log.info(
+                    "Global application commands synced (%s)",
+                    describe_commands(self.tree),
+                )
             self.commands_synced = True
         except (discord.HTTPException, ValueError):
+            # Retried on the next gateway READY, so a rate limit or a blip self-heals.
             log.exception("Could not sync application commands")
+
+    async def purge_global_commands(self) -> None:
+        """Delete globally registered commands left over from an earlier run.
+
+        Guild-scoped commands are what this bot uses, but a global set from a run
+        without `DISCORD_GUILD_ID` survives every later guild resync. Discord then
+        lists both, and invoking the stale copy raises `CommandSignatureMismatch`
+        in autocomplete callbacks (the parameters no longer match the code).
+        """
+        if self.application_id is None:
+            return
+        try:
+            existing = await self.tree.fetch_commands(guild=None)
+        except discord.HTTPException:
+            log.warning("Could not check for stale global commands")
+            return
+        if not existing:
+            return
+        try:
+            # An empty bulk upsert deletes every global command without touching the
+            # local tree, which still holds the commands copied into the guild scope.
+            await self.http.bulk_upsert_global_commands(self.application_id, [])
+        except discord.HTTPException:
+            log.warning("Could not delete stale global commands")
+            return
+        log.warning(
+            "Removed %d stale global application command(s): %s",
+            len(existing),
+            ", ".join(sorted(command.name for command in existing)),
+        )
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user.id)

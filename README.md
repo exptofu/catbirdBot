@@ -110,7 +110,9 @@ All commands require the **Administrator** permission (enforced both by Discord'
 
 Only `/bridge add` (which takes a `group_id`) and `/bridge topics` take a GroupMe id: every other command acts on the channel or post it is run in.
 
-Slash commands sync globally on startup. Set `DISCORD_GUILD_ID` to sync to a single guild instead, which is instant.
+Slash commands sync on every startup. Set `DISCORD_GUILD_ID` to sync to a single guild instead, which is instant.
+
+With `DISCORD_GUILD_ID` set, the bot also deletes any **globally** registered commands left over from an earlier run that had no guild id. A stale global copy survives every later guild resync, appears next to the guild copy in Discord's picker, and raises `CommandSignatureMismatch` in autocomplete once the code's parameters no longer match it. If a command still shows old parameters after a restart, press `Ctrl+R` in Discord so the client re-fetches the command list.
 
 ## GroupMe topics
 

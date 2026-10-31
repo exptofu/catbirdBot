@@ -516,7 +516,8 @@ async def groupme_upload_image(
         body = await response.text()
         if response.status >= 400:
             raise GroupMeError(
-                f"image upload failed with {response.status}: {body[:200]}", response.status
+                f"image upload failed with {response.status} for {len(data)} bytes: {body[:200]}",
+                response.status,
             )
         payload = json.loads(body).get("payload") or {}
         url = payload.get("url") or ""
@@ -643,6 +644,25 @@ def sanitize_webhook_name(name: str) -> str:
     return cleaned[:80]
 
 
+async def read_body_limited(response: aiohttp.ClientResponse, limit: int) -> bytes | None:
+    """Read a whole response body, or None when it exceeds `limit`.
+
+    `StreamReader.read(n)` may return fewer bytes than requested, so the body has
+    to be drained in a loop; a single read truncates large images.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await response.content.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def download_groupme_images(
     session: aiohttp.ClientSession, urls: list[str]
 ) -> list[discord.File]:
@@ -653,8 +673,8 @@ async def download_groupme_images(
                 if response.status != 200:
                     log.warning("Could not download GroupMe image %s (%s)", url, response.status)
                     continue
-                data = await response.content.read(DISCORD_FILE_LIMIT_BYTES + 1)
-                if len(data) > DISCORD_FILE_LIMIT_BYTES:
+                data = await read_body_limited(response, DISCORD_FILE_LIMIT_BYTES)
+                if data is None:
                     log.warning("Skipping GroupMe image %s: larger than %d bytes", url, DISCORD_FILE_LIMIT_BYTES)
                     continue
                 extension = IMAGE_TYPES.get(response.content_type or "", "jpg")
@@ -679,14 +699,17 @@ async def download_discord_image(
         return None
     try:
         async with session.get(
-            attachment.url, timeout=aiohttp.ClientTimeout(total=30)
+            attachment.url, timeout=aiohttp.ClientTimeout(total=60)
         ) as response:
             if response.status != 200:
                 log.warning("Could not download %s (%s)", attachment.url, response.status)
                 return None
-            data = await response.content.read(DISCORD_FILE_LIMIT_BYTES + 1)
-            if len(data) > DISCORD_FILE_LIMIT_BYTES:
+            data = await read_body_limited(response, DISCORD_FILE_LIMIT_BYTES)
+            if data is None:
                 log.warning("Skipping %s: too large after download", attachment.filename)
+                return None
+            if not data:
+                log.warning("Downloaded an empty body for %s", attachment.filename)
                 return None
             return data, attachment.content_type or "image/jpeg"
     except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -793,7 +816,7 @@ async def send_to_topic(
 bridge_group = app_commands.Group(
     name="bridge",
     description="Manage GroupMe <-> Discord bridge links.",
-    default_permissions=discord.Permissions(manage_guild=True),
+    default_permissions=discord.Permissions(administrator=True),
     guild_only=True,
 )
 
@@ -841,12 +864,13 @@ async def bridge_autocomplete(
 
 
 async def require_manager(interaction: discord.Interaction) -> bool:
+    """Bridge management is restricted to server administrators."""
     user = interaction.user
-    if not isinstance(user, discord.Member) or not user.guild_permissions.manage_guild:
+    if not isinstance(user, discord.Member) or not user.guild_permissions.administrator:
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="⚠️ Missing permission",
-                description="Managing bridges needs the Manage Server permission.",
+                description="Managing GroupMe bridges needs the Administrator permission.",
                 color=discord.Color.orange(),
             ),
             ephemeral=True,
@@ -1166,6 +1190,20 @@ async def bridge_set_topic(interaction: discord.Interaction, group_id: str, topi
     channel_id = int(bridge["channel_id"])
     topic_query = (topic or "").strip()
     if topic_query.casefold() in {"", "none", "clear", "off"}:
+        if not bridge["bot_id"]:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ Bot id needed",
+                    description=(
+                        "This bridge has no GroupMe bot, so it cannot post to the main chat. "
+                        "Create a bot with `utils/groupme_setup.py` and run "
+                        "`/bridge set-bot` first."
+                    ),
+                    color=discord.Color.orange(),
+                ),
+                ephemeral=True,
+            )
+            return
         save_bridge(
             bridge["group_id"],
             channel_id,
@@ -1314,6 +1352,9 @@ async def bridge_set_bot(interaction: discord.Interaction, group_id: str, bot_id
         int(bridge["channel_id"]),
         bot_id.strip(),
         bridge["group_name"],
+        topic_id=bridge["topic_id"],
+        topic_name=bridge["topic_name"],
+        send_mode=bridge["send_mode"],
     )
     await interaction.client.refresh_bot_names()
     await interaction.response.send_message(

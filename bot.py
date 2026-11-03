@@ -837,8 +837,27 @@ def quoted_reply(message: discord.Message) -> str:
     return f"> {reference.author.display_name}: {snippet}\n"
 
 
+def groupme_reply_quote(attachment: dict) -> str:
+    """Render a GroupMe `reply` attachment as a Markdown blockquote.
+
+    GroupMe sends a reply as `{"type": "reply", "reply_id", "user_id", "name", "text"}`,
+    but `text` is not always present, so the quote degrades to `> Replying to <name>`.
+    """
+    name = (attachment.get("name") or "").strip()
+    quoted = (attachment.get("text") or "").strip()
+    quoted = truncate(strip_emoji(CUSTOM_EMOJI_RE.sub("", quoted)), 120)
+    if name and quoted:
+        return f"> {name}: {quoted}"
+    if name:
+        return f"> Replying to {name}"
+    if quoted:
+        return f"> {quoted}"
+    return "> (GroupMe reply)"
+
+
 def groupme_message_text(message: dict) -> str:
     parts: list[str] = []
+    quotes: list[str] = []
     text = (message.get("text") or "").strip()
     if text:
         parts.append(text)
@@ -851,9 +870,13 @@ def groupme_message_text(message: dict) -> str:
                 parts.append(f"📍 {label}: https://maps.google.com/?q={lat},{lng}")
         elif kind == "split":
             parts.append("(GroupMe poll split)")
+        elif kind == "reply":
+            # Quoted first, like a Discord reply, so the context reads before the answer.
+            quotes.append(groupme_reply_quote(attachment))
         elif kind not in {"image", "emoji"}:
             parts.append(f"[{kind or 'attachment'}]")
-    return truncate("\n".join(parts).strip())
+    body = "\n".join(parts).strip()
+    return truncate("\n".join(quotes + ([body] if body else [])))
 
 
 def groupme_image_urls(message: dict) -> list[str]:

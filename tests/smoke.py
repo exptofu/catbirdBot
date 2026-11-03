@@ -93,6 +93,21 @@ assert bot.groupme_image_urls(groupme_message) == ["https://i.groupme.com/a"]
 assert "maps.google.com" in bot.groupme_message_text(groupme_message)
 assert bot.groupme_message_text({"attachments": [{"type": "image", "url": "x"}]}) == ""
 
+# GroupMe replies render as a blockquote instead of a bare [reply] marker
+reply = {
+    "text": "sounds good",
+    "attachments": [
+        {"type": "reply", "reply_id": "1", "user_id": "2", "name": "Ann", "text": "meet at 7?"}
+    ],
+}
+rendered_reply = bot.groupme_message_text(reply)
+assert rendered_reply == "> Ann: meet at 7?\nsounds good", rendered_reply
+assert bot.groupme_message_text({"attachments": [{"type": "reply", "name": "Ann"}]}) == "> Replying to Ann"
+assert bot.groupme_message_text({"attachments": [{"type": "reply"}]}) == "> (GroupMe reply)"
+assert "[reply]" not in bot.groupme_message_text({"text": "x", "attachments": [{"type": "reply"}]})
+# a reply whose quoted text is known but whose author is not
+assert bot.groupme_message_text({"attachments": [{"type": "reply", "text": "hi"}]}) == "> hi"
+
 assert bot.sanitize_webhook_name("clyde") == "clyde (GroupMe)"
 assert bot.sanitize_webhook_name("  Ann  ") == "Ann"
 assert bot.sanitize_webhook_name("") == "GroupMe user"

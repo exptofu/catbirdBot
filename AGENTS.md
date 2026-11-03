@@ -59,7 +59,8 @@ a constraint that has already bitten us once.
   picture-only posts), turns user/role mentions into `@Name` and channels into `#name`, and
   strips emoji. Do not reintroduce Discord markup. GroupMe → Discord relays the text
   untouched — no `#topic:` prefix or channel label, because each destination mirrors one
-  conversation.
+  conversation. GroupMe replies become blockquotes (`groupme_reply_quote`); other unknown
+  attachment types still render as `[type]`.
 - **Commands are administrator-only twice over**: `bridge_group`'s
   `default_permissions=administrator` plus `require_manager`. Keep both when adding
   commands.

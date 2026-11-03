@@ -146,7 +146,7 @@ Only two things are tied to a GroupMe account:
 
 1. **Create the account and join every bridged group.** GroupMe allows one account per phone number, so use a dedicated email and phone. `/groups`, `/groups/{id}/subgroups`, bot creation, and topic posts all fail for groups the account is not a member of.
 2. **Copy the new token** while logged in as the new account: <https://dev.groupme.com/applications> → Access Token.
-3. **Delete the old bots, still using the old token.** Bots cannot change owner, and GroupMe rejects a new bot whose callback URL is *"already registered for the group"*. The fallback in `ensure_group_bot` then looks the bot up through `GET /bots`, which only lists the new account's bots, leaving the bridge with no bot at all.
+3. **Delete the old bots, still using the old token.** Bots cannot change owner, and GroupMe rejects a new bot whose callback URL is *"already registered for the group"*. `ensure_group_bot` then looks the bot up through `GET /bots`, which only lists the new account's bots, so the bridge would be left without one — it now falls back to posting with the access token, but the bridged group loses bot attribution until a bot is recreated.
 
    ```powershell
    python utils/bot_admin.py list
@@ -177,6 +177,7 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 - GroupMe text is capped at 1,000 characters. Longer Discord messages are truncated and, when possible, keep their trailing links.
 - Discord replies are relayed with a quoted snippet. Every Discord message starts with `Nickname:` (including picture-only posts, which are separate bot messages), so GroupMe members can see who typed. User and role mentions become `@Name` and channel mentions become `#name`, because GroupMe does not render Discord markup. Emoji are stripped: custom Discord emoji have no GroupMe equivalent and unicode emoji are not relayed.
 - GroupMe messages keep the sender's name and avatar through the channel webhook, and their text is relayed exactly as sent: since every destination mirrors a single conversation, no channel or topic prefix is added. The Discord → GroupMe direction is delineated with `Nickname:` leading every message.
+- GroupMe replies are relayed as a Markdown quote above the text, `> Ann: meet at 7?`, mirroring how Discord replies reach GroupMe. When GroupMe omits the quoted text the line becomes `> Replying to Ann`.
 - Forum posts and threads have no webhook of their own: the bridge creates the webhook on the parent forum/text channel and passes the thread id when posting. An archived post is unarchived before the message is sent.
 - GroupMe messages are mirrored with `AllowedMentions.none()`, so `@everyone` in GroupMe cannot ping Discord.
 - Bot filtering: Discord messages with `author.bot` or a `webhook_id` are skipped (the bridge's own webhooks included). GroupMe messages with `system: true`, `sender_type` other than `user`, no `user_id`, or a name matching a bot owned by the access token are skipped, so give each bridge bot a distinctive name.

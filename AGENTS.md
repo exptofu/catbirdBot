@@ -53,8 +53,10 @@ a constraint that has already bitten us once.
   messages). Do not bypass it.
 - **Edits have no endpoint**; never add code that pretends otherwise. Deletion uses
   the undocumented-but-stable `DELETE /conversations/:conversation_id/messages/:message_id`
-  (204, 404 = already gone). GroupMe never reports deletions, so they are detected by
-  comparing links with the newest `<GROUPME_HISTORY_LIMIT>` messages.
+  (204, 404 = already gone). GroupMe never drops a deleted message from the index: it
+  keeps a tombstone with `deleted_at` and posts a `system` event with
+  `event.type == "message.deleted"` naming the original id. Handle both, and keep the
+  newest-`<GROUPME_HISTORY_LIMIT>` comparison as the fallback.
 - **Deletion links**: `outbound_messages` maps one Discord id to every GroupMe id it
   produced (a bot message becomes one text post plus one picture post per image, and
   `/bots/post` returns no id, so `record_bot_posts` matches them by text and image URL).

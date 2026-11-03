@@ -77,6 +77,14 @@ assert bot.message_id_at_least("12", "10")
 assert not bot.message_id_at_least("9", "10")
 assert not bot.message_id_at_least("x", "10")
 
+# GroupMe exposes deletions as a tombstone and as a `message.deleted` event
+assert bot.groupme_deleted_message_id({"id": "9", "deleted_at": 123}) == "9"
+assert bot.groupme_deleted_message_id(
+    {"id": "10", "event": {"type": "message.deleted", "data": {"message_id": "9"}}}
+) == "9"
+assert bot.groupme_deleted_message_id({"id": "9", "text": "This message was deleted"}) == ""
+assert bot.groupme_deleted_message_id({"id": "9"}) == ""
+
 # retargeting a bridge keeps the destination and the webhook
 bot.update_bridge_conversation("99887", "99888", "topic", "dekalb", "user")
 retargeted = bot.bridge_for_destination(222)

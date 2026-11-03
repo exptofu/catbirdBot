@@ -350,11 +350,13 @@ async def main():
         async def fake_process(message, *, source):
             relayed.append(message["id"])
 
+        original_process = bot.client.process_groupme_message
         bot.client.process_groupme_message = fake_process
         bot.set_last_seen("G1", "6")
         await bot.poll_conversation(session, "G1", bot.bridge_for_conversation("G1"))
         assert relayed == ["10", "11", "12"], relayed
         assert bot.last_seen("G1") == "12"
+        bot.client.process_groupme_message = original_process
 
         # bot mode: text first, then one picture per image, both re-hosted
         POSTED_BOT.clear()
@@ -514,6 +516,49 @@ async def main():
         )
         assert removed_copies == ["4242"], removed_copies
         assert not bot.link_exists(bot.LINK_GROUPME, "G1", "9300")
+
+        # GroupMe keeps a tombstone carrying deleted_at, so the id is still returned
+        LATEST_MESSAGES[:] = [
+            {
+                "id": "9400",
+                "group_id": "G1",
+                "sender_type": "user",
+                "user_id": "u1",
+                "name": "Ann",
+                "text": "This message was deleted",
+                "deleted_at": now_epoch,
+                "created_at": now_epoch,
+            }
+        ]
+        bot.add_link(
+            bot.LINK_GROUPME, "G1", 555, "9400", "4243", datetime.now(timezone.utc)
+        )
+        await bot.client.reconcile_groupme_deletions(
+            session, bot.bridge_for_conversation("G1")
+        )
+        assert removed_copies[-1] == "4243", removed_copies
+        assert not bot.link_exists(bot.LINK_GROUPME, "G1", "9400")
+
+        # ...and posts a system event naming the deleted message, which is immediate
+        bot.add_link(
+            bot.LINK_GROUPME, "G1", 555, "9500", "4244", datetime.now(timezone.utc)
+        )
+        await bot.client.process_groupme_message(
+            {
+                "id": "9501",
+                "group_id": "G1",
+                "sender_type": "system",
+                "user_id": "system",
+                "name": "GroupMe",
+                "system": True,
+                "text": "A message was deleted.",
+                "created_at": now_epoch,
+                "event": {"type": "message.deleted", "data": {"message_id": "9500"}},
+            },
+            source="test",
+        )
+        assert removed_copies[-1] == "4244", removed_copies
+        assert not bot.link_exists(bot.LINK_GROUPME, "G1", "9500")
 
         small = bot.compress_image(b"not-an-image", "image/png", "small.png")
         assert small == (b"not-an-image", "image/png"), small

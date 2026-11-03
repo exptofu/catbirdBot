@@ -1022,6 +1022,23 @@ def is_groupme_bot_message(message: dict) -> bool:
     return bool(name and name in BOT_NAMES)
 
 
+def groupme_deleted_message_id(message: dict) -> str:
+    """The id of a message GroupMe reported as deleted, or "".
+
+    A deletion arrives as a `system` message whose `event.type` is
+    `message.deleted` and whose `event.data.message_id` is the original id; the
+    original message also stays in the index as a tombstone carrying `deleted_at`.
+    The tombstone's text is not used: a real message could contain it.
+    """
+    event = message.get("event") or {}
+    if (event.get("type") or "") == "message.deleted":
+        data = event.get("data") or {}
+        return str(data.get("message_id") or "")
+    if message.get("deleted_at"):
+        return str(message.get("id") or "")
+    return ""
+
+
 def sanitize_webhook_name(name: str) -> str:
     cleaned = (name or "").strip() or "GroupMe user"
     cleaned = cleaned.replace("@", "@\u200b")
@@ -3020,6 +3037,10 @@ class Bot(discord.Client):
                 source,
             )
             return
+        deleted_id = groupme_deleted_message_id(message)
+        if deleted_id:
+            await self.delete_groupme_copy(bridge, deleted_id)
+            return
         if is_groupme_bot_message(message):
             log.debug("Ignoring GroupMe bot/system message in %s via %s", group_id, source)
             return
@@ -3168,6 +3189,29 @@ class Bot(discord.Client):
                 discord_id,
             )
 
+    async def delete_groupme_copy(self, bridge: sqlite3.Row, source_id: str) -> bool:
+        """Delete the Discord copy of a GroupMe message that GroupMe removed."""
+        conversation_id = str(bridge["conversation_id"])
+        source_id = str(source_id)
+        link = db.execute(
+            """
+            SELECT target_id FROM message_links
+             WHERE direction=? AND group_id=? AND source_id=? AND target_id IS NOT NULL
+            """,
+            (LINK_GROUPME, conversation_id, source_id),
+        ).fetchone()
+        if link is None:
+            return False
+        if not await self.delete_discord_copy(bridge, str(link["target_id"])):
+            return False
+        remove_link(LINK_GROUPME, conversation_id, source_id)
+        log.info(
+            "Deleted the Discord copy of GroupMe message %s in %s: it was deleted",
+            source_id,
+            conversation_id,
+        )
+        return True
+
     async def delete_discord_copy(self, bridge: sqlite3.Row, discord_id: str) -> bool:
         """Remove the webhook message that mirrors a GroupMe message."""
         message_id = int(discord_id)
@@ -3230,7 +3274,11 @@ class Bot(discord.Client):
         )
         if not messages:
             return
-        present = {str(message.get("id")) for message in messages if message.get("id")}
+        present = {
+            str(message.get("id"))
+            for message in messages
+            if message.get("id") and not groupme_deleted_message_id(message)
+        }
         complete = len(messages) < GROUPME_HISTORY_LIMIT
         oldest = oldest_numeric_id(messages)
 
@@ -3242,14 +3290,7 @@ class Bot(discord.Client):
             # at or above its oldest entry can be proven absent.
             if not complete and not message_id_at_least(source_id, oldest):
                 continue
-            if await self.delete_discord_copy(bridge, str(link["target_id"])):
-                remove_link(LINK_GROUPME, conversation_id, source_id)
-                log.info(
-                    "Deleted the Discord copy of GroupMe message %s in %s: "
-                    "the message no longer exists",
-                    source_id,
-                    conversation_id,
-                )
+            await self.delete_groupme_copy(bridge, source_id)
 
 
 def poll_reason(bridge: sqlite3.Row) -> str:

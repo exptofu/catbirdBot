@@ -55,6 +55,22 @@ GROUPME_MODE = (os.environ.get("GROUPME_MODE", "poll").strip().lower() or "poll"
 GROUPME_API_BASE = os.environ.get("GROUPME_API_BASE", "https://api.groupme.com/v3").rstrip("/")
 GROUPME_IMAGE_API = os.environ.get("GROUPME_IMAGE_API", "https://image.groupme.com").rstrip("/")
 GROUPME_POLL_SECONDS = max(5, int(os.environ.get("GROUPME_POLL_SECONDS", "10")))
+# Most poll cycles look at only the newest few messages; every
+# GROUPME_POLL_BACKFILL_SECONDS the same loop asks for the wider window instead.
+GROUPME_POLL_RECENT_LIMIT = max(
+    1, min(100, int(os.environ.get("GROUPME_POLL_RECENT_LIMIT", "5")))
+)
+GROUPME_POLL_BACKFILL_SECONDS = max(
+    GROUPME_POLL_SECONDS, int(os.environ.get("GROUPME_POLL_BACKFILL_SECONDS", "300"))
+)
+GROUPME_POLL_BACKFILL_EVERY = max(
+    1, round(GROUPME_POLL_BACKFILL_SECONDS / GROUPME_POLL_SECONDS)
+)
+# Widest window a poll fetches, and the window used to detect deleted messages.
+GROUPME_HISTORY_LIMIT = max(
+    GROUPME_POLL_RECENT_LIMIT,
+    min(100, int(os.environ.get("GROUPME_HISTORY_LIMIT", "25"))),
+)
 GROUPME_REQUEST_DELAY_SECONDS = float(os.environ.get("GROUPME_REQUEST_DELAY_SECONDS", "1"))
 # Mirror deletions: a deleted Discord message removes its GroupMe copy, and a
 # GroupMe message that disappears takes its mirrored Discord copy with it.
@@ -89,7 +105,6 @@ MAX_RETRIES = 5
 # bridges have to be recreated with `/bridge add`.
 SCHEMA_VERSION = 2
 GROUPME_TEXT_LIMIT = 1000
-GROUPME_HISTORY_LIMIT = 100
 MAX_GROUPME_IMAGES = 10
 MAX_DISCORD_FILES = 10
 DISCORD_FILE_LIMIT_BYTES = 8 * 1024 * 1024
@@ -2836,10 +2851,13 @@ class Bot(discord.Client):
             )
         if targets:
             log.info(
-                "Polling %d GroupMe conversation(s) every %ds (%d topic(s), "
-                "%d main chat(s)): %s",
+                "Polling %d GroupMe conversation(s) every %ds (%d-message window, "
+                "%d every %ds; %d topic(s), %d main chat(s)): %s",
                 len(targets),
                 GROUPME_POLL_SECONDS,
+                GROUPME_POLL_RECENT_LIMIT,
+                GROUPME_HISTORY_LIMIT,
+                GROUPME_POLL_BACKFILL_EVERY * GROUPME_POLL_SECONDS,
                 topic_count,
                 len(targets) - topic_count,
                 ", ".join(
@@ -3278,15 +3296,28 @@ async def check_groupme_deletions() -> None:
             await asyncio.sleep(GROUPME_REQUEST_DELAY_SECONDS)
 
 
+poll_cycles = 0
+
+
 @tasks.loop(seconds=GROUPME_POLL_SECONDS)
 async def poll_groupme() -> None:
+    global poll_cycles
+    poll_cycles += 1
+    # Cheap ticks only ask for the newest few messages; every
+    # GROUPME_POLL_BACKFILL_SECONDS the same loop fetches the wider window to catch
+    # up after a restart or a quiet period.
+    limit = (
+        GROUPME_HISTORY_LIMIT
+        if poll_cycles % GROUPME_POLL_BACKFILL_EVERY == 0
+        else GROUPME_POLL_RECENT_LIMIT
+    )
     targets = poll_targets()
     if not targets:
         return
     async with aiohttp.ClientSession() as session:
         for conversation_id, bridge in targets:
             try:
-                await poll_conversation(session, conversation_id, bridge)
+                await poll_conversation(session, conversation_id, bridge, limit=limit)
             except GroupMeError:
                 log.exception("GroupMe poll failed for conversation %s", conversation_id)
             except aiohttp.ClientError:
@@ -3308,7 +3339,11 @@ async def newest_message_id(
 
 
 async def poll_conversation(
-    session: aiohttp.ClientSession, conversation_id: str, bridge: sqlite3.Row
+    session: aiohttp.ClientSession,
+    conversation_id: str,
+    bridge: sqlite3.Row,
+    *,
+    limit: int = GROUPME_POLL_RECENT_LIMIT,
 ) -> None:
     since_id = last_seen(conversation_id)
     if not since_id:
@@ -3325,9 +3360,26 @@ async def poll_conversation(
     if not GROUPME_ACCESS_TOKEN:
         return
 
-    messages = await groupme_list_messages(session, conversation_id, since_id=since_id)
+    messages = await groupme_list_messages(
+        session, conversation_id, since_id=since_id, limit=limit
+    )
     if not messages:
         return
+    # A full short window may hide older messages behind it, so widen before the
+    # cursor advances; otherwise a burst would silently skip the middle of it.
+    if len(messages) >= limit and limit < GROUPME_HISTORY_LIMIT:
+        messages = await groupme_list_messages(
+            session, conversation_id, since_id=since_id, limit=GROUPME_HISTORY_LIMIT
+        )
+        if not messages:
+            return
+    if len(messages) >= GROUPME_HISTORY_LIMIT:
+        log.warning(
+            "Conversation %s has at least %d new messages; anything older than that "
+            "window is skipped",
+            conversation_id,
+            GROUPME_HISTORY_LIMIT,
+        )
 
     # The API returns newest first; relay oldest first so Discord keeps the order.
     for message in reversed(messages):

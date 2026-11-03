@@ -24,6 +24,10 @@ a constraint that has already bitten us once.
   They have no bots and never fire callbacks. A topic bridge stores
   `conversation_type='topic'` and `send_mode='user'`, is polled every cycle, and posts
   with `POST /groups/{topic_id}/messages`.
+- **Polling windows**: most cycles fetch `GROUPME_POLL_RECENT_LIMIT` (5) messages;
+  every `GROUPME_POLL_BACKFILL_SECONDS` (300) a cycle fetches `GROUPME_HISTORY_LIMIT`
+  (25) instead, and a full short window immediately retries wider so a burst is not
+  skipped. `GROUPME_HISTORY_LIMIT` is also the window used to detect deletions.
 - **Posting**: `send_mode='bot'` → `/bots/post`; `send_mode='user'` → `send_as_user()`
   (access token plus `image.groupme.com` uploads), used for topics *and* for groups that
   refuse bots. `/bridge set-mode` can also switch a main-chat bridge to `user` while

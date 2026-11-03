@@ -107,6 +107,7 @@ All commands require the **Administrator** permission (enforced both by Discord'
 | `/bridge list` | Show every bridge: GroupMe conversation, Discord destination, and poster. |
 | `/bridge remove` | Delete the bridge on this channel/post, its webhook, and its message links. |
 | `/bridge set-bot bot_id` | Point a main-chat bridge at a different GroupMe bot. |
+| `/bridge set-mode user\|bot` | Choose the posting path for a main-chat bridge. `user` posts with `GROUPME_ACCESS_TOKEN`, so GroupMe returns the message id and Discord deletions remove the copy; `bot` posts through the GroupMe bot. The bot stays attached either way for inbound callbacks, so switching to `user` does not add polling latency. |
 | `/bridge set-avatar [image_url]` | Give the bridge's bot a profile picture. GroupMe has no bot update endpoint, so the bot is deleted and recreated with the avatar (new bot id). Defaults to the Discord bot's own avatar. |
 | `/bridge test` | Post one test message in each direction for the bridge on this channel/post. |
 
@@ -121,7 +122,7 @@ With `DISCORD_GUILD_ID` set, the bot also deletes any **globally** registered co
 A GroupMe **topic** is a subgroup with its own message stream, its own id, and no bot support. Topics are bridged one-to-one, independently of the group's main chat:
 
 - **GroupMe → Discord**: only the mapped conversation relays, never both. A topic bridge polls its own topic; a main-chat bridge gets bot callbacks, or polls when `GROUPME_MODE=poll` or when the bridge has no bot.
-- **Discord → GroupMe**: a main-chat bridge posts with the group's bot (or with the access token if the group forbids bots); a topic bridge always posts with `GROUPME_ACCESS_TOKEN`, so it appears as the authenticated GroupMe account. Images are uploaded to `image.groupme.com` first so they render inline.
+- **Discord → GroupMe**: a main-chat bridge posts with the group's bot (or with the access token if the group forbids bots, or after `/bridge set-mode user`); a topic bridge always posts with `GROUPME_ACCESS_TOKEN`, so it appears as the authenticated GroupMe account. Images are uploaded to `image.groupme.com` first so they render inline.
 
 One group can therefore have two bridges at the same time — the main chat in one channel and `#cobb` in a forum post — but each conversation has exactly one Discord destination and each destination carries exactly one bridge. `bridges.conversation_id` is the primary key, `bridges.channel_id` is unique, and `/bridge add` refuses a conversation or a destination that is already taken.
 
@@ -179,6 +180,8 @@ Visible effects: topic bridges (`send_mode='user'`) now post as the new account,
 - **GroupMe → Discord**: GroupMe sends no delete callback, so every `GROUPME_DELETE_CHECK_SECONDS` (default 300) the newest 100 messages of each bridged conversation are compared with the stored links. A linked message that is missing from that window has its Discord copy deleted. Messages older than the window are left alone rather than paging through the entire history.
 
 Deleting a *mirrored* GroupMe message in Discord only removes the copy; the GroupMe original stays, because the bridge must not let a Discord cleanup wipe GroupMe history.
+
+Bot posts are owned by the GroupMe bot, and some groups refuse to let the token's account delete them (`403 User not allowed to delete (group deletion mode restriction)`). `/bridge set-mode user` switches a main-chat bridge to posting with the access token; the bot stays attached for callbacks, so inbound remains instant and deletions become exact.
 
 `SYNC_DELETIONS` needs `GROUPME_ACCESS_TOKEN` for the GroupMe side; without it, Discord deletions are logged and skipped.
 

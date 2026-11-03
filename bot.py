@@ -366,6 +366,15 @@ def set_bridge_bot(conversation_id: str, bot_id: str) -> None:
     db.commit()
 
 
+def set_bridge_send_mode(conversation_id: str, send_mode: str) -> None:
+    """Choose the posting path without touching the bot used for callbacks."""
+    db.execute(
+        "UPDATE bridges SET send_mode=? WHERE conversation_id=?",
+        (send_mode, str(conversation_id)),
+    )
+    db.commit()
+
+
 def update_bridge_conversation(
     old_conversation_id: str,
     conversation_id: str,
@@ -2277,6 +2286,131 @@ async def bridge_remove(interaction: discord.Interaction):
     )
 
 
+@bridge_group.command(
+    name="set-mode",
+    description="Choose how Discord messages are posted into GroupMe for this bridge.",
+)
+@app_commands.describe(
+    mode=(
+        "user posts as the access-token account (GroupMe returns the message id, so "
+        "Discord deletions remove it); bot posts as the GroupMe bot"
+    )
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="user (deletable)", value="user"),
+        app_commands.Choice(name="bot", value="bot"),
+    ]
+)
+async def bridge_set_mode(
+    interaction: discord.Interaction, mode: app_commands.Choice[str]
+):
+    if not await require_manager(interaction):
+        return
+    bridge = await bridge_for_target_or_reply(interaction)
+    if bridge is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+    if bridge["conversation_type"] == "topic":
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="⚠️ Topic bridge",
+                description=(
+                    "Topic bridges always post with `GROUPME_ACCESS_TOKEN`, so there is no "
+                    "bot mode to switch to."
+                ),
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return
+
+    if mode.value == "user":
+        if not GROUPME_ACCESS_TOKEN:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ No access token",
+                    description=(
+                        "`GROUPME_ACCESS_TOKEN` is unset, so GroupMe messages cannot be "
+                        "posted as the account."
+                    ),
+                    color=discord.Color.orange(),
+                ),
+                ephemeral=True,
+            )
+            return
+        set_bridge_send_mode(bridge["conversation_id"], "user")
+        description = (
+            f"**{conversation_label(bridge)}** now posts with `GROUPME_ACCESS_TOKEN`.\n\n"
+            "GroupMe returns the message id, so deleting the Discord message deletes the "
+            "GroupMe copy directly. Discord messages now appear from your GroupMe account "
+            "instead of the bot."
+        )
+        if bridge["bot_id"]:
+            description += (
+                "\n\nThe bot stays attached for inbound callbacks, so GroupMe messages "
+                "still arrive instantly."
+            )
+    else:
+        bot_id = str(bridge["bot_id"] or "")
+        note = ""
+        if not bot_id and GROUPME_MODE == "webhook" and not callback_url():
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ No callback URL",
+                    description=(
+                        "This bridge has no bot and no public callback URL is configured, so "
+                        "GroupMe messages currently arrive by polling. Creating a bot now "
+                        "would stop the polling before callbacks work. Set `NGROK_DOMAIN` or "
+                        "`GROUPME_PUBLIC_URL` first, or stay in user mode."
+                    ),
+                    color=discord.Color.orange(),
+                ),
+                ephemeral=True,
+            )
+            return
+        if not bot_id:
+            bot_id, note = await ensure_group_bot(
+                interaction.client.groupme_session,
+                bridge["group_id"],
+                await fresh_bot_avatar(
+                    interaction.client.groupme_session, interaction.client
+                ),
+            )
+            if not bot_id:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="❌ No GroupMe bot",
+                        description=f"GroupMe would not provide a bot. {note}",
+                        color=discord.Color.red(),
+                    ),
+                    ephemeral=True,
+                )
+                return
+            set_bridge_bot(bridge["conversation_id"], bot_id)
+            await interaction.client.refresh_bot_names()
+        set_bridge_send_mode(bridge["conversation_id"], "bot")
+        description = f"**{conversation_label(bridge)}** now posts with bot `{bot_id}`."
+        if GROUPME_MODE == "webhook" and bot_id:
+            description += "\n\nGroupMe messages keep arriving through the bot's callback."
+        if note:
+            description += f"\n\n{note}"
+
+    log.info(
+        "Bridge %s switched to send_mode=%s via /bridge set-mode",
+        bridge["conversation_id"],
+        mode.value,
+    )
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="✅ Posting mode updated",
+            description=description,
+            color=discord.Color.green(),
+        ),
+        ephemeral=True,
+    )
+
+
 @bridge_group.command(name="set-bot", description="Change the GroupMe bot used by this bridge.")
 @app_commands.describe(bot_id="New GroupMe bot id")
 async def bridge_set_bot(interaction: discord.Interaction, bot_id: str):
@@ -2330,6 +2464,8 @@ async def bridge_list(interaction: discord.Interaction):
             if bridge["send_mode"] == "user"
             else f"bot `{bridge['bot_id']}`"
         )
+        if bridge["send_mode"] == "user" and bridge["bot_id"]:
+            poster += f" (callbacks via bot `{bridge['bot_id']}`)"
         embed.add_field(
             name=truncate(bridge["group_name"] or source, 100),
             value=f"{destination_label(bridge)}\n{source}\nposts via {poster}",

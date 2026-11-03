@@ -26,7 +26,10 @@ a constraint that has already bitten us once.
   with `POST /groups/{topic_id}/messages`.
 - **Posting**: `send_mode='bot'` → `/bots/post`; `send_mode='user'` → `send_as_user()`
   (access token plus `image.groupme.com` uploads), used for topics *and* for groups that
-  refuse bots.
+  refuse bots. `/bridge set-mode` can also switch a main-chat bridge to `user` while
+  keeping its bot for callbacks: token posts return their id, so deletion sync is exact,
+  whereas bot posts are owned by the bot and some groups answer `403` when the token's
+  account tries to delete them.
 - **Groups can forbid bots**: `POST /bots` answers `401 unauthorized` for them, even in
   GroupMe's own UI. `/bridge add` must keep falling back to `send_mode='user'` plus
   polling — it is the only way to bridge such a group.

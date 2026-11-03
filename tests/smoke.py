@@ -88,6 +88,11 @@ assert bot.bridge_for_conversation("99887") is None
 bot.set_bridge_bot("12345678", "botxyz")
 assert bot.bridge_for_conversation("12345678")["bot_id"] == "botxyz"
 
+# a main-chat bridge can keep its bot for callbacks but post with the access token
+bot.set_bridge_send_mode("12345678", "user")
+assert bot.bridge_for_conversation("12345678")["send_mode"] == "user"
+assert bot.bridge_for_conversation("12345678")["bot_id"] == "botxyz"
+
 bot.delete_bridge("12345678")
 assert bot.bridge_for_conversation("12345678") is None and bot.last_seen("12345678") is None
 assert bot.outbound_messages(2222) == []

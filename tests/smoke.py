@@ -194,13 +194,19 @@ assert bot.groupme_message_text({"attachments": [{"type": "mentions"}]}) == ""
 assert bot.groupme_message_text(
     {"text": "@Ann hi", "attachments": [{"type": "mentions", "loci": [[99, 4]]}]}
 ) == "@Ann hi"
-# display-name privacy applies to mentioned names as well
+# display-name privacy anonymizes mentioned names; opt-out is anonymized, not dropped
+anonymous_mention = f"**\\@{bot.ANONYMOUS_GROUPME_NAME}**"
 bot.set_groupme_user_mode("John Snarey", bot.PRIVACY_ANONYMIZE)
 anonymized_mentions = bot.groupme_message_text(mention_message)
 assert "John Snarey" not in anonymized_mentions, anonymized_mentions
-assert bot.ANONYMOUS_GROUPME_NAME in anonymized_mentions, anonymized_mentions
+assert anonymous_mention in anonymized_mentions, anonymized_mentions
+assert r"**\@Leigh McDougal**" in anonymized_mentions, anonymized_mentions
 bot.set_groupme_user_mode("John Snarey", bot.PRIVACY_OPTOUT)
-assert "John Snarey" not in bot.groupme_message_text(mention_message)
+opted_out_mentions = bot.groupme_message_text(mention_message)
+assert "John Snarey" not in opted_out_mentions, opted_out_mentions
+assert "hello" in opted_out_mentions, opted_out_mentions
+assert anonymous_mention in opted_out_mentions, opted_out_mentions
+assert r"**\@Leigh McDougal**" in opted_out_mentions, opted_out_mentions
 bot.set_groupme_user_mode("John Snarey", bot.PRIVACY_SHARE)
 assert bot.list_groupme_user_modes() == []
 

@@ -85,7 +85,10 @@ a constraint that has already bitten us once.
   untouched — no `#topic:` prefix or channel label, because each destination mirrors one
   conversation — except that `mentions` attachments are never printed as `[mentions]`:
   their `loci` are re-rendered as bold `\@name`, with the `@` backslash-escaped so a
-  Discord member of the same name is never pinged. GroupMe replies become blockquotes
+  Discord member of the same name is never pinged. A mentioned name follows the same
+  privacy rule, but `optout` is anonymized rather than dropped — a hole in someone else's
+  sentence makes no sense — so both `anonymize` and `optout` render as `**\@GroupMe user**`.
+  GroupMe replies become blockquotes
   (`groupme_reply_quote`); other unknown attachment types still render as `[type]`.
 - **Commands are administrator-only twice over**: `bridge_group`'s
   `default_permissions=administrator` plus `require_manager`. Keep both when adding

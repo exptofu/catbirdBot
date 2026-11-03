@@ -1063,8 +1063,9 @@ def render_groupme_mentions(text: str, attachments: list[dict] | None) -> str:
     attachment itself carries no name, so rendering it as `[mentions]` adds nothing.
     Ranges are applied from the end so earlier offsets stay valid, and the `@` is
     escaped as `\@` so a Discord member with the same name is never mentioned.
-    Display-name privacy applies here too: an anonymized name becomes `GroupMe user`
-    and an opted-out one is dropped.
+    Display-name privacy applies here too, and an opted-out mention is anonymized
+    rather than dropped: dropping it leaves a hole in someone else's sentence. So both
+    `anonymize` and `optout` render as `**\@GroupMe user**`.
     """
     ranges: list[tuple[int, int]] = []
     for attachment in attachments or []:
@@ -1085,13 +1086,9 @@ def render_groupme_mentions(text: str, attachments: list[dict] | None) -> str:
         if not name:
             continue
         privacy = groupme_user_mode(name)
-        if privacy == PRIVACY_OPTOUT:
-            replacement = ""
-        elif privacy == PRIVACY_ANONYMIZE:
-            replacement = ANONYMOUS_GROUPME_NAME
-        else:
-            replacement = f"**\\@{name}**"
-        rendered = rendered[:start] + replacement + rendered[end:]
+        if privacy in (PRIVACY_ANONYMIZE, PRIVACY_OPTOUT):
+            name = ANONYMOUS_GROUPME_NAME
+        rendered = rendered[:start] + f"**\\@{name}**" + rendered[end:]
     return rendered
 
 

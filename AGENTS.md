@@ -34,6 +34,13 @@ a constraint that has already bitten us once.
   keeping its bot for callbacks: token posts return their id, so deletion sync is exact,
   whereas bot posts are owned by the bot and some groups answer `403` when the token's
   account tries to delete them.
+- **Privacy is bridge-wide and keyed by display name**: `groupme_user_privacy` stores
+  a casefolded GroupMe display name with `share`/`anonymize`/`optout`. Never key it on a
+  user id — a renamed user needs a new row. `optout` returns before images are
+  downloaded; `anonymize` posts as `GroupMe user` with no avatar. Replies usually
+  carry neither `name` nor `text` (rendered `> (GroupMe reply)`); when a quote does
+  include a name, an anonymized one becomes `GroupMe user` and an opted-out one drops
+  both name and text. `/privacy set` and `/privacy list` are administrator-only.
 - **Groups can forbid bots**: `POST /bots` answers `401 unauthorized` for them, even in
   GroupMe's own UI. `/bridge add` must keep falling back to `send_mode='user'` plus
   polling — it is the only way to bridge such a group.

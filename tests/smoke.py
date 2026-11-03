@@ -101,6 +101,39 @@ bot.set_bridge_send_mode("12345678", "user")
 assert bot.bridge_for_conversation("12345678")["send_mode"] == "user"
 assert bot.bridge_for_conversation("12345678")["bot_id"] == "botxyz"
 
+# bridge-wide GroupMe display-name privacy, matched without case or extra whitespace
+assert bot.groupme_user_mode("Sheng  Jiang") == ""
+bot.set_groupme_user_mode("Sheng  Jiang", bot.PRIVACY_ANONYMIZE)
+assert bot.groupme_user_mode("sheng jiang") == bot.PRIVACY_ANONYMIZE
+assert [row["name"] for row in bot.list_groupme_user_modes()] == ["Sheng Jiang"]
+bot.set_groupme_user_mode("Sheng Jiang", bot.PRIVACY_OPTOUT)
+assert bot.groupme_user_mode("SHENG JIANG") == bot.PRIVACY_OPTOUT
+assert len(bot.list_groupme_user_modes()) == 1
+bot.set_groupme_user_mode("Sheng Jiang", bot.PRIVACY_SHARE)
+assert bot.groupme_user_mode("Sheng Jiang") == ""
+assert bot.list_groupme_user_modes() == []
+
+# replies to an anonymized or opted-out display name do not leak it
+bot.set_groupme_user_mode("Private Person", bot.PRIVACY_ANONYMIZE)
+quote = bot.groupme_message_text(
+    {
+        "id": "1",
+        "text": "reply",
+        "attachments": [{"type": "reply", "name": "Private Person", "text": "hello"}],
+    }
+)
+assert bot.ANONYMOUS_GROUPME_NAME in quote and "Private Person" not in quote, quote
+bot.set_groupme_user_mode("Private Person", bot.PRIVACY_OPTOUT)
+quote = bot.groupme_message_text(
+    {
+        "id": "2",
+        "text": "reply",
+        "attachments": [{"type": "reply", "name": "Private Person", "text": "secret"}],
+    }
+)
+assert "secret" not in quote and "Private Person" not in quote, quote
+bot.set_groupme_user_mode("Private Person", bot.PRIVACY_SHARE)
+
 bot.delete_bridge("12345678")
 assert bot.bridge_for_conversation("12345678") is None and bot.last_seen("12345678") is None
 assert bot.outbound_messages(2222) == []
@@ -180,5 +213,5 @@ assert rendered == "hey @Ann @Mods in #general done", rendered
 
 # command tree wiring
 names = sorted(c.name for c in bot.client.tree.get_commands())
-assert names == ["bridge"], names
+assert names == ["bridge", "privacy"], names
 print("smoke ok")

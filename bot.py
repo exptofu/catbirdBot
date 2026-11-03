@@ -75,9 +75,9 @@ GROUPME_REQUEST_DELAY_SECONDS = float(os.environ.get("GROUPME_REQUEST_DELAY_SECO
 # Mirror deletions: a deleted Discord message removes its GroupMe copy, and a
 # GroupMe message that disappears takes its mirrored Discord copy with it.
 SYNC_DELETIONS = os.environ.get("SYNC_DELETIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
-# GroupMe has no delete callback, so linked messages are compared with the newest
-# page of each conversation on this interval.
-GROUPME_DELETE_CHECK_SECONDS = max(60, int(os.environ.get("GROUPME_DELETE_CHECK_SECONDS", "300")))
+# GroupMe keeps deleted messages as tombstones and emits a `message.deleted`
+# system event; this interval is the fallback check for links whose event was missed.
+GROUPME_DELETE_CHECK_SECONDS = max(60, int(os.environ.get("GROUPME_DELETE_CHECK_SECONDS", "60")))
 # Loopback by default: the ngrok tunnel forwards to localhost, so nothing has to be
 # reachable from the internet (the callback path has no authentication of its own).
 # Set GROUPME_WEBHOOK_HOST=0.0.0.0 only when a proxy on another host needs to connect.
@@ -122,6 +122,12 @@ GROUPME_BOT_AVATAR_PATH = os.environ.get("GROUPME_BOT_AVATAR_PATH", "").strip()
 GROUPME_BOT_AVATAR_URL = os.environ.get("GROUPME_BOT_AVATAR_URL", "").strip()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LINK_GROUPME = "groupme_to_discord"
+# Bridge-wide policy for GroupMe display names. Keyed by the display name, never
+# the user id, so two users sharing a name share the setting.
+PRIVACY_SHARE = "share"
+PRIVACY_ANONYMIZE = "anonymize"
+PRIVACY_OPTOUT = "optout"
+ANONYMOUS_GROUPME_NAME = "GroupMe user"
 IMAGE_TYPES = {
     "image/jpeg": "jpg",
     "image/jpg": "jpg",
@@ -234,6 +240,15 @@ CREATE_SQL = f"""
         PRIMARY KEY (group_id, discord_id, groupme_id)
     );
     CREATE INDEX IF NOT EXISTS outbound_messages_discord ON outbound_messages (discord_id);
+    -- Bridge-wide GroupMe display-name policy for messages mirrored into Discord.
+    -- Keyed by the display name (casefolded), not the user id; a renamed GroupMe
+    -- user needs a new entry. Kept out of DROP_SQL so it survives a schema rebuild.
+    CREATE TABLE IF NOT EXISTS groupme_user_privacy (
+        name_key TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
     PRAGMA user_version = {SCHEMA_VERSION};
 """
 
@@ -556,6 +571,61 @@ def outbound_groupme_id_exists(group_id: str, groupme_id: str) -> bool:
         ).fetchone()
         is not None
     )
+
+
+def normalize_groupme_name(name: str) -> str:
+    """Match a display name case-insensitively, ignoring repeated whitespace."""
+    return " ".join((name or "").split()).casefold()
+
+
+def clear_groupme_user_mode(name: str) -> None:
+    db.execute(
+        "DELETE FROM groupme_user_privacy WHERE name_key=?",
+        (normalize_groupme_name(name),),
+    )
+    db.commit()
+
+
+def set_groupme_user_mode(name: str, mode: str) -> None:
+    """Store a bridge-wide policy for a GroupMe display name."""
+    if mode not in {PRIVACY_SHARE, PRIVACY_ANONYMIZE, PRIVACY_OPTOUT}:
+        raise ValueError(f"unknown privacy mode {mode!r}")
+    display = " ".join((name or "").split())
+    if not display:
+        return
+    if mode == PRIVACY_SHARE:
+        clear_groupme_user_mode(display)
+        return
+    db.execute(
+        """
+        INSERT INTO groupme_user_privacy (name_key, name, mode, updated_at)
+        VALUES (?,?,?,?)
+        ON CONFLICT(name_key) DO UPDATE SET
+            name=excluded.name,
+            mode=excluded.mode,
+            updated_at=excluded.updated_at
+        """,
+        (display.casefold(), display, mode, iso(utcnow())),
+    )
+    db.commit()
+
+
+def groupme_user_mode(name: str) -> str:
+    """`optout`, `anonymize`, or "" for a GroupMe display name."""
+    key = normalize_groupme_name(name)
+    if not key:
+        return ""
+    row = db.execute(
+        "SELECT mode FROM groupme_user_privacy WHERE name_key=?", (key,)
+    ).fetchone()
+    return str(row["mode"]) if row else ""
+
+
+def list_groupme_user_modes() -> list[sqlite3.Row]:
+    """Every display-name policy, ordered for the /privacy list command."""
+    return db.execute(
+        "SELECT * FROM groupme_user_privacy ORDER BY mode, name COLLATE NOCASE"
+    ).fetchall()
 
 
 # --------------------------------------------------------------------------- #
@@ -963,10 +1033,18 @@ def groupme_reply_quote(attachment: dict) -> str:
     """Render a GroupMe `reply` attachment as a Markdown blockquote.
 
     GroupMe sends a reply as `{"type": "reply", "reply_id", "user_id", "name", "text"}`,
-    but `text` is not always present, so the quote degrades to `> Replying to <name>`.
+    but current payloads often omit both `name` and `text`, leaving
+    `> (GroupMe reply)`. When they are present, the name follows the display-name
+    privacy rule: anonymized names become `GroupMe user`, and an opted-out name loses
+    both the name and the quoted text.
     """
     name = (attachment.get("name") or "").strip()
     quoted = (attachment.get("text") or "").strip()
+    privacy = groupme_user_mode(name)
+    if privacy == PRIVACY_OPTOUT:
+        return "> (replying to a GroupMe user who opted out of Discord sharing)"
+    if privacy == PRIVACY_ANONYMIZE and name:
+        name = ANONYMOUS_GROUPME_NAME
     quoted = truncate(strip_emoji(CUSTOM_EMOJI_RE.sub("", quoted)), 120)
     if name and quoted:
         return f"> {name}: {quoted}"
@@ -2685,6 +2763,96 @@ async def bridge_test(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+privacy_group = app_commands.Group(
+    name="privacy",
+    description="Control how GroupMe display names are mirrored into Discord (all bridges).",
+    default_permissions=discord.Permissions(administrator=True),
+    guild_only=True,
+)
+
+
+@privacy_group.command(
+    name="set", description="Set how one GroupMe display name is mirrored into Discord."
+)
+@app_commands.describe(
+    name="GroupMe display name exactly as it appears in the group",
+    mode="share (default), anonymize (hide name and avatar), or opt out (do not mirror)",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="share", value=PRIVACY_SHARE),
+        app_commands.Choice(name="anonymize", value=PRIVACY_ANONYMIZE),
+        app_commands.Choice(name="opt out", value=PRIVACY_OPTOUT),
+    ]
+)
+async def privacy_set(
+    interaction: discord.Interaction, name: str, mode: app_commands.Choice[str]
+):
+    if not await require_manager(interaction):
+        return
+    display = " ".join(name.split())
+    if not display:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⚠️ Missing display name",
+                description="Pass the GroupMe display name as it appears in the group.",
+                color=discord.Color.orange(),
+            ),
+            ephemeral=True,
+        )
+        return
+    set_groupme_user_mode(display, mode.value)
+    escaped = discord.utils.escape_markdown(display)
+    if mode.value == PRIVACY_SHARE:
+        description = (
+            f"**{escaped}** is mirrored with their GroupMe name and avatar again."
+        )
+    elif mode.value == PRIVACY_ANONYMIZE:
+        description = (
+            f"**{escaped}** is now posted as **{ANONYMOUS_GROUPME_NAME}** without "
+            "their avatar."
+        )
+    else:
+        description = f"Messages from **{escaped}** are no longer mirrored into Discord."
+    description += (
+        "\n\nThis applies to every bridge. Matching uses the GroupMe display name, "
+        "so a renamed user needs the new name."
+    )
+    log.info("Privacy: %s set to %s", display, mode.value)
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="✅ Privacy setting updated",
+            description=description,
+            color=discord.Color.green(),
+        ),
+        ephemeral=True,
+    )
+
+
+@privacy_group.command(
+    name="list", description="Show which GroupMe display names are anonymized or opted out."
+)
+async def privacy_list(interaction: discord.Interaction):
+    if not await require_manager(interaction):
+        return
+    rows = list_groupme_user_modes()
+    anonymized = [r["name"] for r in rows if r["mode"] == PRIVACY_ANONYMIZE]
+    opted_out = [r["name"] for r in rows if r["mode"] == PRIVACY_OPTOUT]
+    embed = discord.Embed(title="GroupMe privacy settings", color=discord.Color.blurple())
+    embed.add_field(
+        name=f"Anonymized ({len(anonymized)})",
+        value=truncate("\n".join(anonymized) or "None", 1024),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"Opted out ({len(opted_out)})",
+        value=truncate("\n".join(opted_out) or "None", 1024),
+        inline=False,
+    )
+    embed.set_footer(text="Matched by GroupMe display name across every bridge.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # --------------------------------------------------------------------------- #
 # Discord client
 # --------------------------------------------------------------------------- #
@@ -2695,6 +2863,7 @@ class Bot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(bridge_group)
+        self.tree.add_command(privacy_group)
         self.commands_synced = False
         self.groupme_session: aiohttp.ClientSession | None = None
         self.web_runner: web.AppRunner | None = None
@@ -3062,6 +3231,17 @@ class Bot(discord.Client):
             )
             return
 
+        privacy = groupme_user_mode(message.get("name") or "")
+        if privacy == PRIVACY_OPTOUT:
+            log.info(
+                "Skipping GroupMe message %s from group %s via %s: the display name "
+                "opted out of Discord sharing",
+                message_id,
+                group_id,
+                source,
+            )
+            return
+
         text = groupme_message_text(message)
         image_urls = groupme_image_urls(message)
         if not text and not image_urls:
@@ -3073,8 +3253,12 @@ class Bot(discord.Client):
             )
             return
 
-        username = sanitize_webhook_name(message.get("name") or "GroupMe user")
-        avatar_url = message.get("avatar_url") or None
+        if privacy == PRIVACY_ANONYMIZE:
+            username = ANONYMOUS_GROUPME_NAME
+            avatar_url = None
+        else:
+            username = sanitize_webhook_name(message.get("name") or "GroupMe user")
+            avatar_url = message.get("avatar_url") or None
         sent: discord.WebhookMessage | None = None
         files: list[discord.File] = []
         for attempt in (1, 2):

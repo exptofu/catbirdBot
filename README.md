@@ -110,6 +110,8 @@ All commands require the **Administrator** permission (enforced both by Discord'
 | `/bridge set-mode user\|bot` | Choose the posting path for a main-chat bridge. `user` posts with `GROUPME_ACCESS_TOKEN`, so GroupMe returns the message id and Discord deletions remove the copy; `bot` posts through the GroupMe bot. The bot stays attached either way for inbound callbacks, so switching to `user` does not add polling latency. |
 | `/bridge set-avatar [image_url]` | Give the bridge's bot a profile picture. GroupMe has no bot update endpoint, so the bot is deleted and recreated with the avatar (new bot id). Defaults to the Discord bot's own avatar. |
 | `/bridge test` | Post one test message in each direction for the bridge on this channel/post. |
+| `/privacy set name mode` | Bridge-wide privacy rule for a GroupMe display name: `share` (default) mirrors their name and avatar, `anonymize` posts as `GroupMe user` without an avatar, `opt out` does not mirror their messages. |
+| `/privacy list` | Summarize every GroupMe display name that is anonymized or opted out. |
 
 Only `/bridge add` (which takes a `group_id`) and `/bridge topics` take a GroupMe id: every other command acts on the channel or post it is run in.
 
@@ -177,13 +179,23 @@ Visible effects: topic bridges (`send_mode='user'`) now post as the new account,
 **Deletions** are mirrored both ways when `SYNC_DELETIONS=true` (the default):
 
 - **Discord → GroupMe**: deleting a bridged Discord message (or purging it) deletes the GroupMe message(s) the bridge created for it. The bridge stores the GroupMe id of every post it makes: token posts return it directly, and bot posts are matched afterwards by text and picture URL because `POST /bots/post` returns no message. GroupMe's public docs list only index/create, but its own clients delete through `DELETE /conversations/:conversation_id/messages/:message_id`, which is what the bridge uses. If GroupMe refuses (for example a bot post the token owner may not remove), the Discord deletion still happens and the failure is logged.
-- **GroupMe → Discord**: GroupMe never removes the message from the index; it replaces the text with `This message was deleted`, sets `deleted_at`, and posts a `system` event whose `event.type` is `message.deleted` and whose `event.data.message_id` is the original id. The bridge acts on that event (or tombstone) immediately when it arrives by callback or poll; every `GROUPME_DELETE_CHECK_SECONDS` (default 300) the newest `GROUPME_HISTORY_LIMIT` (default 25) messages are also compared with the stored links as a fallback. A linked message that is missing, or is a tombstone, has its Discord copy deleted. Messages older than the window are left alone rather than paging through the entire history.
+- **GroupMe → Discord**: GroupMe never removes the message from the index; it replaces the text with `This message was deleted`, sets `deleted_at`, and posts a `system` event whose `event.type` is `message.deleted` and whose `event.data.message_id` is the original id. The bridge acts on that event (or tombstone) immediately when it arrives by callback or poll; every `GROUPME_DELETE_CHECK_SECONDS` (default 60) the newest `GROUPME_HISTORY_LIMIT` (default 25) messages are also compared with the stored links as a fallback. A linked message that is missing, or is a tombstone, has its Discord copy deleted. Messages older than the window are left alone rather than paging through the entire history.
 
 Deleting a *mirrored* GroupMe message in Discord only removes the copy; the GroupMe original stays, because the bridge must not let a Discord cleanup wipe GroupMe history.
 
 Bot posts are owned by the GroupMe bot, and some groups refuse to let the token's account delete them (`403 User not allowed to delete (group deletion mode restriction)`). `/bridge set-mode user` switches a main-chat bridge to posting with the access token; the bot stays attached for callbacks, so inbound remains instant and deletions become exact.
 
 `SYNC_DELETIONS` needs `GROUPME_ACCESS_TOKEN` for the GroupMe side; without it, Discord deletions are logged and skipped.
+
+## Privacy
+
+Privacy settings are **bridge-wide** and keyed by the GroupMe **display name**, not the user id. Display names are not unique, so two users sharing one share the rule, and a renamed user needs the new name.
+
+- `share` (default) mirrors the display name and avatar as before.
+- `anonymize` relays the message as **GroupMe user** with no avatar. The text itself is unchanged.
+- `opt out` does not relay that display name's messages at all; images are not downloaded.
+
+`/privacy set name:<display name> mode:<share|anonymize|opt out>` manages a rule and `/privacy list` summarizes the current ones. Quoted replies only expose a name when GroupMe includes one: current payloads often carry neither `name` nor `text` and render as `> (GroupMe reply)`, so there is nothing to anonymize on that path. When a quote does carry a name, an anonymized one becomes `GroupMe user` and an opted-out one loses both the name and the quoted text (the reply's own text is still relayed).
 
 ## Behaviour notes
 

@@ -560,6 +560,46 @@ async def main():
         assert removed_copies[-1] == "4244", removed_copies
         assert not bot.link_exists(bot.LINK_GROUPME, "G1", "9500")
 
+        # opted-out display names are not mirrored; anonymized ones lose name/avatar
+        sent_payloads = []
+
+        async def fake_send(bridge, **payload):
+            sent_payloads.append(payload)
+
+            class Sent:
+                id = 777777
+
+            return Sent()
+
+        original_send = bot.client.send_via_webhook
+        bot.client.send_via_webhook = fake_send
+        bot.set_groupme_user_mode("Quiet Person", bot.PRIVACY_OPTOUT)
+        try:
+            message = {
+                "id": "9600",
+                "group_id": "G1",
+                "sender_type": "user",
+                "user_id": "u2",
+                "name": "Quiet Person",
+                "avatar_url": "https://i.groupme.com/q.jpg",
+                "text": "should not appear",
+                "created_at": now_epoch,
+            }
+            await bot.client.process_groupme_message(dict(message), source="test")
+            assert sent_payloads == [], sent_payloads
+            assert not bot.link_exists(bot.LINK_GROUPME, "G1", "9600")
+
+            bot.set_groupme_user_mode("Quiet Person", bot.PRIVACY_ANONYMIZE)
+            await bot.client.process_groupme_message(
+                dict(message, id="9601"), source="test"
+            )
+            assert sent_payloads[-1]["username"] == bot.ANONYMOUS_GROUPME_NAME
+            assert sent_payloads[-1]["avatar_url"] is None
+            assert sent_payloads[-1]["content"] == "should not appear"
+        finally:
+            bot.client.send_via_webhook = original_send
+            bot.set_groupme_user_mode("Quiet Person", bot.PRIVACY_SHARE)
+
         small = bot.compress_image(b"not-an-image", "image/png", "small.png")
         assert small == (b"not-an-image", "image/png"), small
 

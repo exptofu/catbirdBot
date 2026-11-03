@@ -75,7 +75,7 @@ The unit uses `KillSignal=SIGINT` because `discord.py` shuts down on SIGINT thro
    | `poll` (default) | The bot reads group history every `GROUPME_POLL_SECONDS` using the access token | No public URL |
    | `webhook` | GroupMe POSTs each group message to the bot's callback URL | A public URL, forwarded to `GROUPME_WEBHOOK_PORT` + `GROUPME_WEBHOOK_PATH` |
 
-   In `webhook` mode every bridge bot's callback URL must point at the same endpoint. Use a long, unguessable `GROUPME_WEBHOOK_PATH`; GroupMe does not sign callbacks, so the path is the only secret protecting the endpoint.
+   In `webhook` mode every bridge bot's callback URL must point at the same endpoint. Use a long, unguessable `GROUPME_WEBHOOK_PATH`; GroupMe does not sign callbacks, so the path is the only secret protecting the endpoint. `GROUPME_WEBHOOK_HOST` defaults to `127.0.0.1`, so the port stays off the internet when ngrok or a proxy on the same host forwards to it; set it to `0.0.0.0` only if the proxy runs on another machine.
 
    ### ngrok tunnel
 

@@ -52,7 +52,10 @@ GROUPME_API_BASE = os.environ.get("GROUPME_API_BASE", "https://api.groupme.com/v
 GROUPME_IMAGE_API = os.environ.get("GROUPME_IMAGE_API", "https://image.groupme.com").rstrip("/")
 GROUPME_POLL_SECONDS = max(5, int(os.environ.get("GROUPME_POLL_SECONDS", "10")))
 GROUPME_REQUEST_DELAY_SECONDS = float(os.environ.get("GROUPME_REQUEST_DELAY_SECONDS", "1"))
-GROUPME_WEBHOOK_HOST = os.environ.get("GROUPME_WEBHOOK_HOST", "0.0.0.0")
+# Loopback by default: the ngrok tunnel forwards to localhost, so nothing has to be
+# reachable from the internet (the callback path has no authentication of its own).
+# Set GROUPME_WEBHOOK_HOST=0.0.0.0 only when a proxy on another host needs to connect.
+GROUPME_WEBHOOK_HOST = os.environ.get("GROUPME_WEBHOOK_HOST", "127.0.0.1")
 GROUPME_WEBHOOK_PORT = int(os.environ.get("GROUPME_WEBHOOK_PORT", "8085"))
 GROUPME_WEBHOOK_PATH = os.environ.get("GROUPME_WEBHOOK_PATH", "/groupme/callback")
 GROUPME_PUBLIC_URL = os.environ.get("GROUPME_PUBLIC_URL", "").rstrip("/")
@@ -2515,19 +2518,26 @@ class Bot(discord.Client):
         else:
             log.info("GroupMe transport: poll (every %ds)", GROUPME_POLL_SECONDS)
 
-        topic_bridges = [
-            bridge for bridge in list_bridges() if bridge["conversation_type"] == "topic"
-        ]
-        if topic_bridges and not GROUPME_ACCESS_TOKEN:
+        targets = poll_targets()
+        topic_count = sum(1 for _cid, bridge in targets if bridge["conversation_type"] == "topic")
+        if targets and not GROUPME_ACCESS_TOKEN:
             log.error(
-                "%d topic bridge(s) need GROUPME_ACCESS_TOKEN; they will not receive messages.",
-                len(topic_bridges),
+                "%d polled conversation(s) need GROUPME_ACCESS_TOKEN; they will not "
+                "receive messages.",
+                len(targets),
             )
-        if topic_bridges:
+        if targets:
             log.info(
-                "Polling %d topic conversation(s) every %ds (topics have no callbacks)",
-                len(topic_bridges),
+                "Polling %d GroupMe conversation(s) every %ds (%d topic(s), "
+                "%d main chat(s)): %s",
+                len(targets),
                 GROUPME_POLL_SECONDS,
+                topic_count,
+                len(targets) - topic_count,
+                ", ".join(
+                    f"{conversation_id} ({poll_reason(bridge)})"
+                    for conversation_id, bridge in targets
+                ),
             )
 
         # The loop is harmless when there is nothing to poll: topics are always polled,
@@ -2643,34 +2653,75 @@ class Bot(discord.Client):
         if not isinstance(payload, dict):
             return web.json_response({"ok": False}, status=400)
         # Acknowledge immediately; GroupMe retries slow callbacks.
-        asyncio.create_task(self.process_groupme_message(payload, source="webhook"))
+        self.spawn_groupme_processing(payload)
         return web.json_response({"ok": True})
+
+    def spawn_groupme_processing(self, payload: dict) -> None:
+        """Ingest off the request task, logging failures instead of swallowing them."""
+        task = asyncio.create_task(self.process_groupme_message(payload, source="webhook"))
+
+        def report(completed: asyncio.Task) -> None:
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                log.error(
+                    "GroupMe callback for message %s failed",
+                    payload.get("id"),
+                    exc_info=error,
+                )
+
+        task.add_done_callback(report)
 
     async def process_groupme_message(self, message: dict, *, source: str) -> None:
         group_id = str(message.get("group_id") or "")
+        message_id = str(message.get("id") or "")
         if not group_id:
+            log.info(
+                "Ignoring GroupMe message %s via %s: payload has no group_id",
+                message_id or "?",
+                source,
+            )
             return
         bridge = bridge_for_conversation(group_id)
         if bridge is None:
-            log.debug("Ignoring GroupMe message for unbridged conversation %s", group_id)
+            log.info(
+                "Ignoring GroupMe message %s from group %s via %s: conversation is not bridged",
+                message_id or "?",
+                group_id,
+                source,
+            )
             return
         if is_groupme_bot_message(message):
             log.debug("Ignoring GroupMe bot/system message in %s via %s", group_id, source)
             return
 
-        message_id = str(message.get("id") or "")
         if not message_id:
+            log.info(
+                "Ignoring GroupMe message via %s: group %s payload has no id", source, group_id
+            )
             return
         if message_id in RECENT_OUTBOUND:
-            log.debug("Skipping GroupMe message %s posted by the bridge", message_id)
+            log.info("Skipping GroupMe message %s: posted by the bridge itself", message_id)
             return
         if link_exists(LINK_GROUPME, group_id, message_id):
-            log.debug("Skipping already-relayed GroupMe message %s", message_id)
+            log.info(
+                "Skipping already-relayed GroupMe message %s (group %s, via %s)",
+                message_id,
+                group_id,
+                source,
+            )
             return
 
         text = groupme_message_text(message)
         image_urls = groupme_image_urls(message)
         if not text and not image_urls:
+            log.info(
+                "Ignoring GroupMe message %s from group %s via %s: no text and no images",
+                message_id,
+                group_id,
+                source,
+            )
             return
 
         username = sanitize_webhook_name(message.get("name") or "GroupMe user")
@@ -2720,11 +2771,12 @@ class Bot(discord.Client):
         )
         set_last_seen(group_id, message_id)
         log.info(
-            "Relayed GroupMe message %s from group %s to channel %s (%d image(s))",
+            "Relayed GroupMe message %s from group %s to channel %s (%d image(s), via %s)",
             message_id,
             group_id,
             bridge["channel_id"],
             len(files),
+            source,
         )
 
     # -- Discord events ----------------------------------------------------- #
@@ -2739,6 +2791,15 @@ class Bot(discord.Client):
             await relay_discord_message(self.groupme_session, message, bridge, self)
         except (GroupMeError, discord.HTTPException):
             log.exception("Could not relay Discord message %s to GroupMe", message.id)
+
+
+def poll_reason(bridge: sqlite3.Row) -> str:
+    """Why `poll_targets` polls this bridge; used in the startup summary."""
+    if bridge["conversation_type"] == "topic":
+        return "topic"
+    if not bridge["bot_id"]:
+        return "no bot"
+    return "poll mode"
 
 
 def poll_targets() -> list[tuple[str, sqlite3.Row]]:
@@ -2831,7 +2892,9 @@ if __name__ == "__main__":
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     try:
-        client.run(DISCORD_TOKEN)
+        # log_handler=None keeps discord.py from adding its own handler, so every line
+        # is formatted once by basicConfig instead of appearing twice.
+        client.run(DISCORD_TOKEN, log_handler=None)
     except discord.PrivilegedIntentsRequired:
         log.error(
             "Discord rejected the login: enable MESSAGE CONTENT INTENT under "

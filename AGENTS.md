@@ -86,6 +86,9 @@ were dropped. Use `read_body_limited` for downloads — `StreamReader.read(n)` t
 - Webhook mode can expose the aiohttp callback server through the `ngrok` SDK
   (`NGROK_ENABLED`, `NGROK_DOMAIN`, `NGROK_AUTHTOKEN`). The tunnel URL replaces
   `PUBLIC_BASE_URL` at startup and must match what `/bridge add` prints.
+  `GROUPME_WEBHOOK_HOST` defaults to `127.0.0.1`: GroupMe does not sign callbacks, so the
+  endpoint must not be reachable from the internet. Only set `0.0.0.0` for a proxy on
+  another host. `GROUPME_WEBHOOK_PATH` is the only secret protecting it.
 - `requirements.txt` pins ngrok by interpreter (`>=1.4,<1.5` below 3.12, `>=1.7` above);
   both SDKs support the calls used in `start_tunnel`. Check `requires_python` on PyPI
   before raising the floor. Avoid new dependencies for what the stdlib already does.

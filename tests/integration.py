@@ -12,6 +12,8 @@ POSTED_MESSAGE = []
 CREATED_BOTS = []
 UPLOADS = []
 CALLS = []
+DELETED_MESSAGES = []
+LATEST_MESSAGES = []
 
 
 def build_big_png():
@@ -123,12 +125,23 @@ async def cdn(request):
     return web.Response(body=BIG_PNG, content_type="image/png")
 
 
+async def message_delete(request):
+    DELETED_MESSAGES.append(
+        (request.match_info["group_id"], request.match_info["message_id"])
+    )
+    return web.Response(status=204)
+
+
 async def group_messages(request):
     gid = request.match_info["group_id"]
     since = request.query.get("since_id")
     CALLS.append(f"{gid}:{since}")
     if since == "5":
         return web.Response(status=304)
+    if not since:
+        return web.json_response(
+            {"response": {"count": len(LATEST_MESSAGES), "messages": list(LATEST_MESSAGES)}}
+        )
     if since == "6":
         return web.json_response(
             {
@@ -208,6 +221,12 @@ class Message:
     ]
 
 
+class BotMessage(Message):
+    """A second Discord message, so its outbound links are easy to isolate."""
+
+    id = 1001
+
+
 async def main():
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.router.add_post("/bots/post", bot_post)
@@ -216,6 +235,7 @@ async def main():
     app.router.add_post("/bots/destroy", bots_destroy)
     app.router.add_post("/groups/{group_id}/messages", message_post)
     app.router.add_get("/groups/{group_id}/messages", group_messages)
+    app.router.add_delete("/conversations/{group_id}/messages/{message_id}", message_delete)
     app.router.add_get("/groups/{group_id}/subgroups", subgroups)
     app.router.add_get("/groups/{group_id}", group)
     app.router.add_get("/groups", group_index)
@@ -306,6 +326,8 @@ async def main():
             conversation_type="topic",
             group_id="G2",
             group_name="Topic Group",
+            target_kind="thread",
+            parent_id=700,
             send_mode="user",
         )
         topic_bridge = bot.bridge_for_conversation("T1")
@@ -397,6 +419,101 @@ async def main():
         assert POSTED_MESSAGE[0]["group_id"] == "G3", POSTED_MESSAGE[0]
         assert POSTED_MESSAGE[0]["text"].startswith("Ann: hello group"), POSTED_MESSAGE[0]
         assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
+        # token posts return their message id, so the Discord message can be deleted later
+        assert [row["groupme_id"] for row in bot.outbound_messages(Message.id)] == [
+            "9001",
+            "9001",
+        ], bot.outbound_messages(Message.id)
+
+        # /bots/post returns nothing, so bot posts are matched back by text and picture
+        now_epoch = int(datetime.now(timezone.utc).timestamp())
+        LATEST_MESSAGES[:] = [
+            {
+                "id": "9102",
+                "group_id": "G1",
+                "sender_type": "bot",
+                "user_id": "b1",
+                "name": "Catbird Bridge",
+                "text": "Ann:",
+                "created_at": now_epoch,
+                "attachments": [{"type": "image", "url": "https://i.groupme.com/test.jpg"}],
+            },
+            {
+                "id": "9101",
+                "group_id": "G1",
+                "sender_type": "bot",
+                "user_id": "b1",
+                "name": "Catbird Bridge",
+                "text": "Ann: hello group\nhttps://cdn.discordapp.com/b.pdf",
+                "created_at": now_epoch,
+            },
+        ]
+        POSTED_BOT.clear()
+        bot.save_bridge("G1", 555, "bot-1", "Testers", group_name="Testers")
+        await bot.relay_discord_message(session, BotMessage(), bot.bridge_for_conversation("G1"))
+        assert sorted(row["groupme_id"] for row in bot.outbound_messages(BotMessage.id)) == [
+            "9101",
+            "9102",
+        ], bot.outbound_messages(BotMessage.id)
+
+        # deleting the Discord message deletes every GroupMe copy it produced
+        bot.client.groupme_session = session
+        DELETED_MESSAGES.clear()
+        await bot.client.sync_discord_deletion(BotMessage.id)
+        assert sorted(DELETED_MESSAGES) == [("G1", "9101"), ("G1", "9102")], DELETED_MESSAGES
+        assert bot.outbound_messages(BotMessage.id) == [], bot.outbound_messages(BotMessage.id)
+
+        # thread destinations pass the thread id; plain channels must omit it
+        webhook_calls = []
+
+        class FakeWebhook:
+            async def delete_message(self, message_id, **kwargs):
+                webhook_calls.append((message_id, kwargs))
+
+        async def fake_get_webhook(bridge, *, refresh=False):
+            return FakeWebhook()
+
+        bot.client.get_webhook = fake_get_webhook
+        assert await bot.client.delete_discord_copy(
+            bot.bridge_for_conversation("G1"), "4242"
+        )
+        assert webhook_calls[-1] == (4242, {}), webhook_calls
+        assert await bot.client.delete_discord_copy(topic_bridge, "4243")
+        assert webhook_calls[-1][0] == 4243, webhook_calls
+        assert webhook_calls[-1][1]["thread"].id == 777, webhook_calls
+
+        # a GroupMe message missing from the newest page loses its Discord copy
+        removed_copies = []
+
+        async def fake_delete_copy(bridge, discord_id):
+            removed_copies.append(discord_id)
+            return True
+
+        bot.client.delete_discord_copy = fake_delete_copy
+        LATEST_MESSAGES[:] = [
+            {
+                "id": "9200",
+                "group_id": "G1",
+                "sender_type": "user",
+                "user_id": "u1",
+                "name": "Ann",
+                "text": "still here",
+                "created_at": now_epoch,
+            }
+        ]
+        bot.add_link(
+            bot.LINK_GROUPME,
+            "G1",
+            555,
+            "9300",
+            "4242",
+            datetime.now(timezone.utc),
+        )
+        await bot.client.reconcile_groupme_deletions(
+            session, bot.bridge_for_conversation("G1")
+        )
+        assert removed_copies == ["4242"], removed_copies
+        assert not bot.link_exists(bot.LINK_GROUPME, "G1", "9300")
 
         small = bot.compress_image(b"not-an-image", "image/png", "small.png")
         assert small == (b"not-an-image", "image/png"), small

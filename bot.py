@@ -17,7 +17,11 @@ Message flow:
 Every `/bridge` command except `add` and `topics` acts on the channel or post it
 was run in, so no command takes a Discord channel argument.
 
-Edits are not mirrored: GroupMe's public API has no edit or delete endpoint.
+Deletions are mirrored in both directions. GroupMe's public docs list only index
+and create, but its own clients delete through the `conversations` endpoint, which
+is what `groupme_delete_message` uses. GroupMe never reports a deletion, so the
+poller compares the newest page of each bridged conversation with the stored
+links. Edits are still not mirrored.
 """
 import asyncio
 import inspect
@@ -52,6 +56,12 @@ GROUPME_API_BASE = os.environ.get("GROUPME_API_BASE", "https://api.groupme.com/v
 GROUPME_IMAGE_API = os.environ.get("GROUPME_IMAGE_API", "https://image.groupme.com").rstrip("/")
 GROUPME_POLL_SECONDS = max(5, int(os.environ.get("GROUPME_POLL_SECONDS", "10")))
 GROUPME_REQUEST_DELAY_SECONDS = float(os.environ.get("GROUPME_REQUEST_DELAY_SECONDS", "1"))
+# Mirror deletions: a deleted Discord message removes its GroupMe copy, and a
+# GroupMe message that disappears takes its mirrored Discord copy with it.
+SYNC_DELETIONS = os.environ.get("SYNC_DELETIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
+# GroupMe has no delete callback, so linked messages are compared with the newest
+# page of each conversation on this interval.
+GROUPME_DELETE_CHECK_SECONDS = max(60, int(os.environ.get("GROUPME_DELETE_CHECK_SECONDS", "300")))
 # Loopback by default: the ngrok tunnel forwards to localhost, so nothing has to be
 # reachable from the internet (the callback path has no authentication of its own).
 # Set GROUPME_WEBHOOK_HOST=0.0.0.0 only when a proxy on another host needs to connect.
@@ -111,6 +121,8 @@ REQUIRED_PERMS = discord.Permissions(
     send_messages=True,
     read_message_history=True,
     manage_webhooks=True,
+    # Fallback for deleting a mirrored message when its webhook was replaced.
+    manage_messages=True,
 )
 
 log = logging.getLogger("catbird")
@@ -196,6 +208,17 @@ CREATE_SQL = f"""
         PRIMARY KEY (direction, group_id, source_id)
     );
     CREATE INDEX IF NOT EXISTS message_links_source ON message_links (direction, source_id);
+    -- Discord message -> GroupMe message(s) posted by the bridge, for deletion sync.
+    -- One Discord message can become several GroupMe messages: the text post plus
+    -- one picture post per image, because /bots/post returns no message id.
+    CREATE TABLE IF NOT EXISTS outbound_messages (
+        group_id TEXT NOT NULL,
+        discord_id TEXT NOT NULL,
+        groupme_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (group_id, discord_id, groupme_id)
+    );
+    CREATE INDEX IF NOT EXISTS outbound_messages_discord ON outbound_messages (discord_id);
     PRAGMA user_version = {SCHEMA_VERSION};
 """
 
@@ -204,6 +227,7 @@ DROP_SQL = """
     DROP TABLE IF EXISTS bridges_v1;
     DROP TABLE IF EXISTS group_state;
     DROP TABLE IF EXISTS message_links;
+    DROP TABLE IF EXISTS outbound_messages;
 """
 
 
@@ -408,6 +432,7 @@ def save_webhook(conversation_id: str, webhook_id: int, webhook_token: str) -> N
 def delete_bridge(conversation_id: str) -> None:
     db.execute("DELETE FROM bridges WHERE conversation_id=?", (str(conversation_id),))
     db.execute("DELETE FROM group_state WHERE group_id=?", (str(conversation_id),))
+    db.execute("DELETE FROM outbound_messages WHERE group_id=?", (str(conversation_id),))
     db.execute("DELETE FROM message_links WHERE group_id=?", (str(conversation_id),))
     db.commit()
 
@@ -454,6 +479,56 @@ def link_exists(direction: str, group_id: str, source_id: str) -> bool:
         db.execute(
             "SELECT 1 FROM message_links WHERE direction=? AND group_id=? AND source_id=?",
             (direction, str(group_id), str(source_id)),
+        ).fetchone()
+        is not None
+    )
+
+
+def remove_link(direction: str, group_id: str, source_id: str) -> None:
+    db.execute(
+        "DELETE FROM message_links WHERE direction=? AND group_id=? AND source_id=?",
+        (direction, str(group_id), str(source_id)),
+    )
+    db.commit()
+
+
+def add_outbound(
+    group_id: str, discord_id: str | int, groupme_id: str, created_at: datetime
+) -> None:
+    """Remember which GroupMe message(s) a Discord message became."""
+    db.execute(
+        """
+        INSERT OR REPLACE INTO outbound_messages
+            (group_id, discord_id, groupme_id, created_at)
+        VALUES (?,?,?,?)
+        """,
+        (str(group_id), str(discord_id), str(groupme_id), iso(created_at)),
+    )
+    db.commit()
+
+
+def outbound_messages(discord_id: str | int) -> list[sqlite3.Row]:
+    """GroupMe messages that were posted for a Discord message, across conversations."""
+    return db.execute(
+        "SELECT * FROM outbound_messages WHERE discord_id=? ORDER BY created_at",
+        (str(discord_id),),
+    ).fetchall()
+
+
+def remove_outbound(group_id: str, discord_id: str | int, groupme_id: str) -> None:
+    db.execute(
+        "DELETE FROM outbound_messages WHERE group_id=? AND discord_id=? AND groupme_id=?",
+        (str(group_id), str(discord_id), str(groupme_id)),
+    )
+    db.commit()
+
+
+def outbound_groupme_id_exists(group_id: str, groupme_id: str) -> bool:
+    """Whether a GroupMe message is already attributed to some Discord message."""
+    return (
+        db.execute(
+            "SELECT 1 FROM outbound_messages WHERE group_id=? AND groupme_id=?",
+            (str(group_id), str(groupme_id)),
         ).fetchone()
         is not None
     )
@@ -584,6 +659,26 @@ async def groupme_list_messages(
     if not response:
         return []
     return response.get("messages") or []
+
+
+async def groupme_delete_message(
+    session: aiohttp.ClientSession, conversation_id: str, message_id: str
+) -> None:
+    """Delete a message the token owner is allowed to remove.
+
+    GroupMe documents only index and create, but its own clients delete through
+    `DELETE /conversations/:conversation_id/messages/:message_id` (204). A 404
+    means the message is already gone, which is the desired end state.
+    """
+    try:
+        await groupme_request(
+            session,
+            "DELETE",
+            f"/conversations/{conversation_id}/messages/{message_id}",
+        )
+    except GroupMeError as error:
+        if error.status != 404:
+            raise
 
 
 async def groupme_list_bots(session: aiohttp.ClientSession) -> list[dict]:
@@ -1074,6 +1169,74 @@ def bridged_channel_id(message: discord.Message) -> int:
     return message.channel.id
 
 
+def oldest_numeric_id(messages: list[dict]) -> str:
+    """Smallest numeric message id in a page, or "" when ids are not numeric."""
+    ids = [str(message.get("id") or "") for message in messages]
+    if not ids or not all(message_id.isdigit() for message_id in ids):
+        return ""
+    return str(min(int(message_id) for message_id in ids))
+
+
+def message_id_at_least(message_id: str, boundary: str) -> bool:
+    """Whether `message_id` falls inside a page whose oldest entry is `boundary`."""
+    try:
+        return int(message_id) >= int(boundary)
+    except (TypeError, ValueError):
+        return False
+
+
+async def record_bot_posts(
+    session: aiohttp.ClientSession,
+    conversation_id: str,
+    discord_id: int,
+    posts: list[tuple[str, str]],
+) -> None:
+    """Find the GroupMe ids of bot posts so a Discord deletion can remove them.
+
+    `POST /bots/post` returns no message, so the newest bot messages are matched
+    by exact text and, for picture posts, by image URL. This is best-effort: a
+    message that cannot be found simply has no GroupMe id to delete later.
+    """
+    if not posts or not GROUPME_ACCESS_TOKEN:
+        return
+    try:
+        messages = await groupme_list_messages(session, conversation_id, limit=50)
+    except GroupMeError:
+        log.debug(
+            "Could not look up GroupMe ids for Discord message %s", discord_id, exc_info=True
+        )
+        return
+
+    cutoff = time.time() - 300
+    claimed: set[str] = set()
+    for text, picture_url in posts:
+        for message in messages:
+            message_id = str(message.get("id") or "")
+            if not message_id or message_id in claimed:
+                continue
+            # Never attach an older bot post to a newer Discord message.
+            if outbound_groupme_id_exists(conversation_id, message_id):
+                continue
+            if not is_groupme_bot_message(message):
+                continue
+            if (message.get("text") or "") != text:
+                continue
+            image_urls = groupme_image_urls(message)
+            if picture_url:
+                if picture_url not in image_urls:
+                    continue
+            elif image_urls:
+                continue
+            try:
+                if int(message.get("created_at") or 0) < cutoff:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            claimed.add(message_id)
+            add_outbound(conversation_id, discord_id, message_id, utcnow())
+            break
+
+
 async def relay_discord_message(
     session: aiohttp.ClientSession,
     message: discord.Message,
@@ -1118,7 +1281,7 @@ async def relay_discord_message(
         body = truncate(body)
 
     if bridge["send_mode"] == "user":
-        await send_as_user(session, bridge, body, hosted)
+        await send_as_user(session, bridge, body, hosted, discord_id=message.id)
     else:
         bot_id = bridge["bot_id"]
         try:
@@ -1130,8 +1293,13 @@ async def relay_discord_message(
                 raise
             bot_id = await recover_bot_id(session, bridge)
             await groupme_post_bot(session, bot_id, body)
+        posts: list[tuple[str, str]] = [(body, "")]
         for image_url in hosted:
             await groupme_post_bot(session, bot_id, header, picture_url=image_url)
+            posts.append((header, image_url))
+        await record_bot_posts(
+            session, outbound_conversation_id(bridge), message.id, posts
+        )
 
     log.info(
         "Relayed Discord message %s from #%s to GroupMe conversation %s (%d image(s), %d failed)",
@@ -1260,6 +1428,8 @@ async def send_as_user(
     bridge: sqlite3.Row,
     body: str,
     image_urls: list[str],
+    *,
+    discord_id: int | None = None,
 ) -> None:
     """Post with the access token instead of a bot.
 
@@ -1285,6 +1455,8 @@ async def send_as_user(
             None,
             utcnow(),
         )
+        if discord_id is not None:
+            add_outbound(conversation_id, discord_id, message_id, utcnow())
         cutoff = time.monotonic() - 900
         for key in [key for key, stamp in RECENT_OUTBOUND.items() if stamp < cutoff]:
             RECENT_OUTBOUND.pop(key, None)
@@ -2544,6 +2716,8 @@ class Bot(discord.Client):
         # main chats only when GROUPME_MODE=poll or the bridge has no bot.
         if not poll_groupme.is_running():
             poll_groupme.start()
+        if SYNC_DELETIONS and not check_groupme_deletions.is_running():
+            check_groupme_deletions.start()
 
         invite = discord.utils.oauth_url(self.user.id, permissions=REQUIRED_PERMS, scopes=("bot",))
         log.info("Bot invite URL (Manage Webhooks + message permissions): %s", invite)
@@ -2792,6 +2966,137 @@ class Bot(discord.Client):
         except (GroupMeError, discord.HTTPException):
             log.exception("Could not relay Discord message %s to GroupMe", message.id)
 
+    async def on_raw_message_delete(self, payload) -> None:
+        await self.sync_discord_deletion(payload.message_id)
+
+    async def on_raw_bulk_message_delete(self, payload) -> None:
+        # A purge does not fire one event per message, so walk the ids ourselves.
+        for message_id in payload.message_ids:
+            await self.sync_discord_deletion(message_id)
+
+    async def sync_discord_deletion(self, discord_id: int) -> None:
+        """Delete the GroupMe copy of a Discord message that was removed."""
+        if not SYNC_DELETIONS:
+            return
+        rows = outbound_messages(discord_id)
+        if not rows:
+            return
+        if not GROUPME_ACCESS_TOKEN:
+            log.warning(
+                "Discord message %s was deleted, but GROUPME_ACCESS_TOKEN is unset; "
+                "its GroupMe copy cannot be removed",
+                discord_id,
+            )
+            return
+        for row in rows:
+            conversation_id = str(row["group_id"])
+            groupme_id = str(row["groupme_id"])
+            try:
+                await groupme_delete_message(
+                    self.groupme_session, conversation_id, groupme_id
+                )
+            except GroupMeError as error:
+                log.warning(
+                    "Could not delete GroupMe message %s in %s after Discord message %s "
+                    "was deleted: %s",
+                    groupme_id,
+                    conversation_id,
+                    discord_id,
+                    error,
+                )
+                continue
+            remove_outbound(conversation_id, discord_id, groupme_id)
+            remove_link(LINK_GROUPME, conversation_id, groupme_id)
+            log.info(
+                "Deleted GroupMe message %s in %s because Discord message %s was deleted",
+                groupme_id,
+                conversation_id,
+                discord_id,
+            )
+
+    async def delete_discord_copy(self, bridge: sqlite3.Row, discord_id: str) -> bool:
+        """Remove the webhook message that mirrors a GroupMe message."""
+        message_id = int(discord_id)
+        thread = (
+            discord.Object(id=int(bridge["channel_id"]))
+            if bridge["target_kind"] == "thread"
+            else None
+        )
+        try:
+            webhook = await self.get_webhook(bridge)
+            # `thread=None` would make discord.py read `.id` from None; omit it instead.
+            if thread is None:
+                await webhook.delete_message(message_id)
+            else:
+                await webhook.delete_message(message_id, thread=thread)
+            return True
+        except (discord.HTTPException, RuntimeError):
+            # Includes the case where the webhook was replaced: the token no longer
+            # owns the old copy, so the bot itself has to remove it.
+            log.warning(
+                "The bridge webhook could not delete Discord message %s; trying the bot token",
+                message_id,
+            )
+        try:
+            channel = self.get_channel(
+                int(bridge["channel_id"])
+            ) or await self.fetch_channel(int(bridge["channel_id"]))
+            await channel.get_partial_message(message_id).delete()
+            return True
+        except discord.NotFound:
+            return True
+        except (discord.HTTPException, AttributeError):
+            log.exception(
+                "Could not delete Discord message %s mirroring a GroupMe message", message_id
+            )
+            return False
+
+    async def reconcile_groupme_deletions(
+        self, session: aiohttp.ClientSession, bridge: sqlite3.Row
+    ) -> None:
+        """Delete Discord copies of GroupMe messages that no longer exist.
+
+        GroupMe emits no delete callback, so the newest page of the conversation is
+        compared with the links this bridge recorded. Only linked messages inside
+        that page can be checked; older ones are left alone rather than paged for.
+        """
+        conversation_id = str(bridge["conversation_id"])
+        links = db.execute(
+            """
+            SELECT source_id, target_id FROM message_links
+             WHERE direction=? AND group_id=? AND target_id IS NOT NULL
+            """,
+            (LINK_GROUPME, conversation_id),
+        ).fetchall()
+        if not links:
+            return
+
+        messages = await groupme_list_messages(
+            session, conversation_id, limit=GROUPME_HISTORY_LIMIT
+        )
+        if not messages:
+            return
+        present = {str(message.get("id")) for message in messages if message.get("id")}
+        complete = len(messages) < GROUPME_HISTORY_LIMIT
+        oldest = oldest_numeric_id(messages)
+
+        for link in links:
+            source_id = str(link["source_id"])
+            if source_id in present:
+                continue
+            # A page shorter than the limit covers all history; otherwise only ids
+            # at or above its oldest entry can be proven absent.
+            if not complete and not message_id_at_least(source_id, oldest):
+                continue
+            if await self.delete_discord_copy(bridge, str(link["target_id"])):
+                remove_link(LINK_GROUPME, conversation_id, source_id)
+                log.info(
+                    "Deleted the Discord copy of GroupMe message %s in %s: "
+                    "the message no longer exists",
+                    source_id,
+                    conversation_id,
+                )
+
 
 def poll_reason(bridge: sqlite3.Row) -> str:
     """Why `poll_targets` polls this bridge; used in the startup summary."""
@@ -2818,6 +3123,23 @@ def poll_targets() -> list[tuple[str, sqlite3.Row]]:
         ):
             targets.append((str(bridge["conversation_id"]), bridge))
     return targets
+
+
+@tasks.loop(seconds=GROUPME_DELETE_CHECK_SECONDS)
+async def check_groupme_deletions() -> None:
+    """Remove Discord copies of GroupMe messages that were deleted in GroupMe."""
+    if not SYNC_DELETIONS or not GROUPME_ACCESS_TOKEN:
+        return
+    async with aiohttp.ClientSession() as session:
+        for bridge in list_bridges():
+            conversation_id = str(bridge["conversation_id"])
+            try:
+                await client.reconcile_groupme_deletions(session, bridge)
+            except GroupMeError:
+                log.exception("Could not check %s for deleted messages", conversation_id)
+            except aiohttp.ClientError:
+                log.exception("GroupMe deletion check failed for %s", conversation_id)
+            await asyncio.sleep(GROUPME_REQUEST_DELAY_SECONDS)
 
 
 @tasks.loop(seconds=GROUPME_POLL_SECONDS)

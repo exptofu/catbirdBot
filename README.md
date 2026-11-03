@@ -11,6 +11,7 @@ A two-way bridge between GroupMe and Discord. Each GroupMe conversation — a gr
 - **No bot required**: when a group refuses bot creation (GroupMe answers `401` for that group, even in its own UI), the bridge falls back to posting with `GROUPME_ACCESS_TOKEN` and polls the group every `GROUPME_POLL_SECONDS` instead of relying on callbacks.
 - **Photos**: GroupMe images are downloaded and re-uploaded as Discord attachments; Discord images are downloaded, compressed, and re-hosted on GroupMe's image service for both group and topic bridges. GroupMe rejects non-GroupMe image URLs (`invalid origin`), so an image that cannot be re-hosted is skipped and the message notes how many were dropped.
 - **No bot echo**: bot messages are skipped on both sides, and token posts are tracked so they are not mirrored back.
+- **Deletion sync**: deleting a bridged Discord message deletes the GroupMe message(s) it produced; deleting a GroupMe message removes its Discord copy. Set `SYNC_DELETIONS=false` to turn this off.
 
 ## Run
 
@@ -27,7 +28,7 @@ Fill in `.env`, then run:
 python bot.py
 ```
 
-`bot.py` needs the **Message Content** privileged intent enabled for the application in the Discord Developer Portal, plus `View Channel`, `Send Messages`, `Read Message History`, and `Manage Webhooks` in the bridged channels. The bot logs its invite URL on startup.
+`bot.py` needs the **Message Content** privileged intent enabled for the application in the Discord Developer Portal, plus `View Channel`, `Send Messages`, `Read Message History`, and `Manage Webhooks` in the bridged channels. `Manage Messages` is recommended: it is the fallback that deletes a mirrored Discord message when the bridge webhook has been replaced. The bot logs its invite URL on startup.
 
 ## Deploy (systemd)
 
@@ -168,9 +169,18 @@ Only two things are tied to a GroupMe account:
 Visible effects: topic bridges (`send_mode='user'`) now post as the new account, including its name and avatar; group bridges still post through the bot, so only the bot's owning account changes. Keep the new account in the groups permanently — removing it breaks polling, topic relay, and image upload even though the bots keep firing callbacks. The old account can leave the groups after the new bots post successfully, but keep it alive until then, because its token is the only way to delete its bots.
 
 
-## Edits
+## Edits and deletions
 
-Not mirrored. GroupMe's public API exposes only *index* and *create* for messages — no edit or delete endpoint — so a Discord edit cannot be applied to the GroupMe copy, and GroupMe never reports edited content.
+**Edits** are not mirrored. GroupMe's public API exposes only *index* and *create* for messages, so a Discord edit cannot be applied to the GroupMe copy, and GroupMe never reports edited content.
+
+**Deletions** are mirrored both ways when `SYNC_DELETIONS=true` (the default):
+
+- **Discord → GroupMe**: deleting a bridged Discord message (or purging it) deletes the GroupMe message(s) the bridge created for it. The bridge stores the GroupMe id of every post it makes: token posts return it directly, and bot posts are matched afterwards by text and picture URL because `POST /bots/post` returns no message. GroupMe's public docs list only index/create, but its own clients delete through `DELETE /conversations/:conversation_id/messages/:message_id`, which is what the bridge uses. If GroupMe refuses (for example a bot post the token owner may not remove), the Discord deletion still happens and the failure is logged.
+- **GroupMe → Discord**: GroupMe sends no delete callback, so every `GROUPME_DELETE_CHECK_SECONDS` (default 300) the newest 100 messages of each bridged conversation are compared with the stored links. A linked message that is missing from that window has its Discord copy deleted. Messages older than the window are left alone rather than paging through the entire history.
+
+Deleting a *mirrored* GroupMe message in Discord only removes the copy; the GroupMe original stays, because the bridge must not let a Discord cleanup wipe GroupMe history.
+
+`SYNC_DELETIONS` needs `GROUPME_ACCESS_TOKEN` for the GroupMe side; without it, Discord deletions are logged and skipped.
 
 ## Behaviour notes
 
@@ -204,7 +214,7 @@ Not mirrored. GroupMe's public API exposes only *index* and *create* for message
 | `tests/smoke.py` | Fast checks for DB helpers and bridge constraints, rendering, and topic matching. |
 | `tests/integration.py` | Offline end-to-end run against a fake GroupMe API (relays, images, bot creation fallbacks, token posting). |
 | `deploy/catbird-bot.service` | systemd unit that runs the bot from `/opt/catbirdBot` as the `catbird` user. |
-| `catbird.db` | SQLite store for bridges, poll cursors, and message links. Safe to delete only when every bridge can be recreated. |
+| `catbird.db` | SQLite store for bridges, poll cursors, message links, and outbound GroupMe ids used by deletion sync. Safe to delete only when every bridge can be recreated. |
 
 Run the checks with:
 

@@ -44,7 +44,15 @@ a constraint that has already bitten us once.
   to `NGROK_DOMAIN` so scripts outside the bot process still get a valid callback.
 - **`groupme_request`** owns pacing and retries (429 + 5xx backoff, `304` means no new
   messages). Do not bypass it.
-- **No edits or deletes** exist in the API. Never add code that pretends otherwise.
+- **Edits have no endpoint**; never add code that pretends otherwise. Deletion uses
+  the undocumented-but-stable `DELETE /conversations/:conversation_id/messages/:message_id`
+  (204, 404 = already gone). GroupMe never reports deletions, so they are detected by
+  comparing links with the newest `<GROUPME_HISTORY_LIMIT>` messages.
+- **Deletion links**: `outbound_messages` maps one Discord id to every GroupMe id it
+  produced (a bot message becomes one text post plus one picture post per image, and
+  `/bots/post` returns no id, so `record_bot_posts` matches them by text and image URL).
+  `message_links` rows with `target_id IS NULL` are the bridge's own token posts and must
+  stay out of the reconciliation that deletes Discord copies.
 
 ## Discord specifics
 

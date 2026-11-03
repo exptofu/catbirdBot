@@ -57,6 +57,26 @@ assert bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 assert bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 assert not bot.link_exists("nope", "12345678", "555")
 
+# a Discord message can map to several GroupMe messages (text plus one per image)
+bot.add_outbound("12345678", 2222, "555", datetime.now(timezone.utc))
+bot.add_outbound("12345678", 2222, "556", datetime.now(timezone.utc))
+assert sorted(row["groupme_id"] for row in bot.outbound_messages(2222)) == ["555", "556"]
+assert bot.outbound_messages(3333) == []
+assert bot.outbound_groupme_id_exists("12345678", "556")
+assert not bot.outbound_groupme_id_exists("12345678", "999")
+bot.remove_outbound("12345678", 2222, "555")
+assert [row["groupme_id"] for row in bot.outbound_messages(2222)] == ["556"]
+bot.remove_link(bot.LINK_GROUPME, "12345678", "555")
+assert not bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
+
+# page-window helpers used to decide whether a missing message was really deleted
+assert bot.oldest_numeric_id([{"id": "12"}, {"id": "10"}]) == "10"
+assert bot.oldest_numeric_id([{"id": "abc"}]) == ""
+assert bot.oldest_numeric_id([]) == ""
+assert bot.message_id_at_least("12", "10")
+assert not bot.message_id_at_least("9", "10")
+assert not bot.message_id_at_least("x", "10")
+
 # retargeting a bridge keeps the destination and the webhook
 bot.update_bridge_conversation("99887", "99888", "topic", "dekalb", "user")
 retargeted = bot.bridge_for_destination(222)
@@ -70,6 +90,7 @@ assert bot.bridge_for_conversation("12345678")["bot_id"] == "botxyz"
 
 bot.delete_bridge("12345678")
 assert bot.bridge_for_conversation("12345678") is None and bot.last_seen("12345678") is None
+assert bot.outbound_messages(2222) == []
 bot.delete_bridge("99888")
 
 # helpers

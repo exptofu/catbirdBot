@@ -175,6 +175,35 @@ assert "[reply]" not in bot.groupme_message_text({"text": "x", "attachments": [{
 # a reply whose quoted text is known but whose author is not
 assert bot.groupme_message_text({"attachments": [{"type": "reply", "text": "hi"}]}) == "> hi"
 
+# GroupMe mentions become bold, backslash-escaped names, never a [mentions] token
+mention_text = "@Leigh McDougal @John Snarey - hello"
+mention_message = {
+    "text": mention_text,
+    "attachments": [
+        {"type": "mentions", "loci": [[0, 15], [16, 12]], "user_ids": ["1", "2"]}
+    ],
+}
+rendered_mentions = bot.groupme_message_text(mention_message)
+assert "[mentions]" not in rendered_mentions, rendered_mentions
+assert r"**\@Leigh McDougal**" in rendered_mentions, rendered_mentions
+assert r"**\@John Snarey**" in rendered_mentions, rendered_mentions
+assert "\u200b" not in rendered_mentions, rendered_mentions
+# a mentions attachment with no text at all renders nothing instead of a marker
+assert bot.groupme_message_text({"attachments": [{"type": "mentions"}]}) == ""
+# an empty or out-of-range loci is left as plain text rather than raising
+assert bot.groupme_message_text(
+    {"text": "@Ann hi", "attachments": [{"type": "mentions", "loci": [[99, 4]]}]}
+) == "@Ann hi"
+# display-name privacy applies to mentioned names as well
+bot.set_groupme_user_mode("John Snarey", bot.PRIVACY_ANONYMIZE)
+anonymized_mentions = bot.groupme_message_text(mention_message)
+assert "John Snarey" not in anonymized_mentions, anonymized_mentions
+assert bot.ANONYMOUS_GROUPME_NAME in anonymized_mentions, anonymized_mentions
+bot.set_groupme_user_mode("John Snarey", bot.PRIVACY_OPTOUT)
+assert "John Snarey" not in bot.groupme_message_text(mention_message)
+bot.set_groupme_user_mode("John Snarey", bot.PRIVACY_SHARE)
+assert bot.list_groupme_user_modes() == []
+
 assert bot.sanitize_webhook_name("clyde") == "clyde (GroupMe)"
 assert bot.sanitize_webhook_name("  Ann  ") == "Ann"
 assert bot.sanitize_webhook_name("") == "GroupMe user"

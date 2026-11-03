@@ -1055,13 +1055,55 @@ def groupme_reply_quote(attachment: dict) -> str:
     return "> (GroupMe reply)"
 
 
+def render_groupme_mentions(text: str, attachments: list[dict] | None) -> str:
+    r"""Bold each GroupMe mention and defuse it so Discord cannot ping anyone.
+
+    GroupMe sends a mention as `{"type": "mentions", "loci": [[start, length]],
+    "user_ids": [...]}` while the display name only exists inside `text`; the
+    attachment itself carries no name, so rendering it as `[mentions]` adds nothing.
+    Ranges are applied from the end so earlier offsets stay valid, and the `@` is
+    escaped as `\@` so a Discord member with the same name is never mentioned.
+    Display-name privacy applies here too: an anonymized name becomes `GroupMe user`
+    and an opted-out one is dropped.
+    """
+    ranges: list[tuple[int, int]] = []
+    for attachment in attachments or []:
+        if (attachment.get("type") or "").lower() != "mentions":
+            continue
+        for locus in attachment.get("loci") or []:
+            if not isinstance(locus, (list, tuple)) or len(locus) != 2:
+                continue
+            try:
+                start, length = int(locus[0]), int(locus[1])
+            except (TypeError, ValueError):
+                continue
+            if length > 0 and start >= 0 and start + length <= len(text):
+                ranges.append((start, start + length))
+    rendered = text
+    for start, end in sorted(set(ranges), reverse=True):
+        name = rendered[start:end].strip().lstrip("@").strip()
+        if not name:
+            continue
+        privacy = groupme_user_mode(name)
+        if privacy == PRIVACY_OPTOUT:
+            replacement = ""
+        elif privacy == PRIVACY_ANONYMIZE:
+            replacement = ANONYMOUS_GROUPME_NAME
+        else:
+            replacement = f"**\\@{name}**"
+        rendered = rendered[:start] + replacement + rendered[end:]
+    return rendered
+
+
 def groupme_message_text(message: dict) -> str:
     parts: list[str] = []
     quotes: list[str] = []
-    text = (message.get("text") or "").strip()
+    attachments = message.get("attachments") or []
+    # Mentions are resolved against the raw text, before trimming shifts the offsets.
+    text = render_groupme_mentions(message.get("text") or "", attachments).strip()
     if text:
         parts.append(text)
-    for attachment in message.get("attachments") or []:
+    for attachment in attachments:
         kind = (attachment.get("type") or "").lower()
         if kind == "location":
             label = attachment.get("name") or "Location"
@@ -1073,7 +1115,7 @@ def groupme_message_text(message: dict) -> str:
         elif kind == "reply":
             # Quoted first, like a Discord reply, so the context reads before the answer.
             quotes.append(groupme_reply_quote(attachment))
-        elif kind not in {"image", "emoji"}:
+        elif kind not in {"image", "emoji", "mentions"}:
             parts.append(f"[{kind or 'attachment'}]")
     body = "\n".join(parts).strip()
     return truncate("\n".join(quotes + ([body] if body else [])))

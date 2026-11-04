@@ -5,6 +5,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+import discord
 from aiohttp import web
 
 POSTED_BOT = []
@@ -227,6 +228,48 @@ class BotMessage(Message):
     id = 1001
 
 
+class NickMember:
+    """A guild member whose nickname is what GroupMe should see."""
+
+    def __init__(self, user_id, nick, name="account"):
+        self.id = user_id
+        self.nick = nick
+        self.name = name
+
+    @property
+    def display_name(self):
+        return self.nick or self.name
+
+
+class FakeResponse:
+    status = 404
+    reason = "Not Found"
+
+
+class MentionGuild:
+    """Member 42 is cached; 43 needs a fetch; 44 is not a member at all."""
+
+    def __init__(self):
+        self.cached = {42: NickMember(42, "Ann")}
+        self.fetch_calls = []
+
+    def get_member(self, user_id):
+        return self.cached.get(user_id)
+
+    async def fetch_member(self, user_id):
+        self.fetch_calls.append(user_id)
+        if user_id == 43:
+            return NickMember(43, "Bo")
+        raise discord.NotFound(FakeResponse(), {"code": 10007, "message": "Unknown Member"})
+
+
+class MentionMessage:
+    content = "hi <@42> and <@!43> and <@44>"
+    mentions = [NickMember(42, None, name="ann_2024")]
+    role_mentions = []
+    channel_mentions = []
+
+
 async def main():
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.router.add_post("/bots/post", bot_post)
@@ -264,6 +307,18 @@ async def main():
     import bot
 
     async with aiohttp.ClientSession() as session:
+        # mentions are rendered with the member's server nickname, not the account name;
+        # uncached members are fetched and non-members fall back to `@user`
+        mention_guild = MentionGuild()
+        mention_message = MentionMessage()
+        mention_message.guild = mention_guild
+        names = await bot.resolve_mention_names(mention_message)
+        assert names == {42: "Ann", 43: "Bo"}, names
+        assert sorted(mention_guild.fetch_calls) == [43, 44], mention_guild.fetch_calls
+        assert (
+            bot.render_discord_content(mention_message, names) == "hi @Ann and @Bo and @user"
+        ), bot.render_discord_content(mention_message, names)
+
         UPLOADS.clear()
         avatar_url = await bot.fresh_bot_avatar(session)
         assert avatar_url == "https://i.groupme.com/test.jpg", avatar_url

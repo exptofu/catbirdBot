@@ -246,6 +246,22 @@ FakeMessage.channel_mentions = [FakeChannel(9, "general")]
 rendered = bot.render_discord_content(FakeMessage)
 assert rendered == "hey @Ann @Mods in #general done", rendered
 
+# a server nickname resolved for the relay wins over the name on the mention
+class FakeUnresolvedMessage:
+    id = 2
+    content = "ping <@77> and <@!78>"
+    mentions = []
+    role_mentions = []
+    channel_mentions = []
+
+
+renamed = bot.render_discord_content(FakeMessage, {42: "Ann (nick)"})
+assert renamed == "hey @Ann (nick) @Mods in #general done", renamed
+# ids discord.py never resolved still get their nickname instead of `@user`
+unresolved = bot.render_discord_content(FakeUnresolvedMessage, {77: "Cobb", 78: "Dekalb"})
+assert unresolved == "ping @Cobb and @Dekalb", unresolved
+assert bot.render_discord_content(FakeUnresolvedMessage) == "ping @user and @user"
+
 # command tree wiring
 names = sorted(c.name for c in bot.client.tree.get_commands())
 assert names == ["bridge", "privacy"], names

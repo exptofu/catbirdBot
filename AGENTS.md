@@ -81,7 +81,11 @@ a constraint that has already bitten us once.
   never echo back.
 - **Text rendering**: Discord → GroupMe starts every message with `Nickname:` (including
   picture-only posts), turns user/role mentions into `@Name` and channels into `#name`, and
-  strips emoji. Do not reintroduce Discord markup. GroupMe → Discord relays the text
+  strips emoji. A user mention is the member's **server nickname**, not the account
+  username: `resolve_mention_names` re-reads the ids from the content because
+  `message.mentions` drops members discord.py never resolved, checks `guild.get_member`,
+  then `guild.fetch_member` (cached by discord.py) before rendering. Do not reintroduce
+  Discord markup. GroupMe → Discord relays the text
   untouched — no `#topic:` prefix or channel label, because each destination mirrors one
   conversation — except that `mentions` attachments are never printed as `[mentions]`:
   their `loci` are re-rendered as bold `\@name`, with the `@` backslash-escaped so a

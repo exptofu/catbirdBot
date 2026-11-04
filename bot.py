@@ -996,16 +996,53 @@ def strip_emoji(text: str) -> str:
     return UNICODE_EMOJI_RE.sub("", text)
 
 
-def render_discord_content(message: discord.Message) -> str:
+async def resolve_mention_names(message: discord.Message) -> dict[int, str]:
+    """Map mentioned user ids to the nickname they use in this server.
+
+    `message.mentions` only holds the members discord.py happened to resolve, and a
+    member it could not resolve carries no server nickname, so each id in the content
+    is looked up in the guild cache and then fetched from the API. The nickname is the
+    name GroupMe members recognise; the account's display name and username are only
+    fallbacks.
+    """
+    content = message.content or ""
+    known = list(getattr(message, "mentions", None) or ())
+    ids = {int(user_id) for user_id in USER_MENTION_RE.findall(content)}
+    ids.update(user.id for user in known)
+    if not ids:
+        return {}
+    guild = getattr(message, "guild", None)
+    names: dict[int, str] = {}
+    for user_id in ids:
+        member = guild.get_member(user_id) if guild is not None else None
+        if member is None:
+            member = discord.utils.get(known, id=user_id)
+        if member is None and guild is not None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except discord.HTTPException:
+                member = None
+        if member is not None:
+            names[user_id] = member.display_name or member.name
+    return names
+
+
+def render_discord_content(
+    message: discord.Message, names: dict[int, str] | None = None
+) -> str:
     """Rewrite Discord mention syntax into text GroupMe members can read.
 
     Users and roles become `@Name`, channels become `#name`, and emoji are
-    removed instead of being passed through as unreadable markup.
+    removed instead of being passed through as unreadable markup. `names` carries
+    the server nicknames from `resolve_mention_names`, which also covers mentions
+    discord.py did not resolve into `message.mentions`.
     """
     text = message.content or ""
+    resolved = dict(names or {})
     for user in message.mentions:
-        name = user.display_name if isinstance(user, discord.Member) else user.name
-        text = text.replace(f"<@{user.id}>", f"@{name}").replace(f"<@!{user.id}>", f"@{name}")
+        resolved.setdefault(user.id, user.display_name or user.name)
+    for user_id, name in resolved.items():
+        text = text.replace(f"<@{user_id}>", f"@{name}").replace(f"<@!{user_id}>", f"@{name}")
     for role in message.role_mentions:
         text = text.replace(f"<@&{role.id}>", f"@{role.name}")
     for channel in message.channel_mentions:
@@ -1402,7 +1439,7 @@ async def relay_discord_message(
     client=None,
 ) -> None:
     name = message.author.display_name or message.author.name
-    text = render_discord_content(message)
+    text = render_discord_content(message, await resolve_mention_names(message))
     images = [a for a in message.attachments if is_image_attachment(a)]
     links = [a.url for a in message.attachments if not is_image_attachment(a)]
 

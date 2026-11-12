@@ -633,7 +633,16 @@ async def main():
             return Sent()
 
         original_send = bot.client.send_via_webhook
+        original_get_channel = bot.client.get_channel
         bot.client.send_via_webhook = fake_send
+
+        class UploadGuild:
+            filesize_limit = 25 * 1024 * 1024
+
+        class UploadChannel:
+            guild = UploadGuild()
+
+        bot.client.get_channel = lambda _channel_id: UploadChannel()
         bot.set_groupme_user_mode("Quiet Person", bot.PRIVACY_OPTOUT)
         try:
             message = {
@@ -680,13 +689,30 @@ async def main():
                 await bot.client.process_groupme_message(
                     dict(video_message, id="9604"), source="test"
                 )
+                assert len(sent_payloads[-1]["files"]) == 1
+                assert sent_payloads[-1]["files"][0].filename == "groupme-video-1.mp4"
+            finally:
+                bot.DISCORD_FILE_LIMIT_BYTES = original_file_limit
+
+            video_url = video_message["attachments"][0]["url"]
+            UploadGuild.filesize_limit = len(VIDEO_BYTES) - 1
+            bot.DISCORD_FILE_LIMIT_BYTES = len(VIDEO_BYTES) + 1
+            try:
+                await bot.client.process_groupme_message(
+                    dict(video_message, id="9605"), source="test"
+                )
                 assert sent_payloads[-1]["files"] == []
                 assert (
                     sent_payloads[-1]["content"]
-                    == "Video: http://127.0.0.1:8731/cdn/video.mp4"
+                    == f"Video: {video_url}"
                 )
+                await bot.client.process_groupme_message(
+                    dict(video_message, id="9606", text=video_url), source="test"
+                )
+                assert sent_payloads[-1]["content"] == video_url
             finally:
                 bot.DISCORD_FILE_LIMIT_BYTES = original_file_limit
+                UploadGuild.filesize_limit = 25 * 1024 * 1024
 
             LATEST_MESSAGES[:] = [
                 {
@@ -715,6 +741,7 @@ async def main():
             assert sent_payloads[-1]["content"] == "> Bea: the quoted original\nmy reply"
         finally:
             bot.client.send_via_webhook = original_send
+            bot.client.get_channel = original_get_channel
             bot.set_groupme_user_mode("Quiet Person", bot.PRIVACY_SHARE)
 
         small = bot.compress_image(b"not-an-image", "image/png", "small.png")

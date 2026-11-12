@@ -1316,7 +1316,7 @@ async def download_groupme_images(
 
 
 async def download_groupme_videos(
-    session: aiohttp.ClientSession, urls: list[str], max_files: int
+    session: aiohttp.ClientSession, urls: list[str], max_files: int, max_bytes: int
 ) -> tuple[list[discord.File], list[str]]:
     files: list[discord.File] = []
     failed_urls = urls[max_files:]
@@ -1330,12 +1330,12 @@ async def download_groupme_videos(
                     )
                     failed_urls.append(url)
                     continue
-                data = await read_body_limited(response, DISCORD_FILE_LIMIT_BYTES)
+                data = await read_body_limited(response, max_bytes)
                 if data is None:
                     log.warning(
                         "Skipping GroupMe video %s: larger than %d bytes",
                         url,
-                        DISCORD_FILE_LIMIT_BYTES,
+                        max_bytes,
                     )
                     failed_urls.append(url)
                     continue
@@ -3327,6 +3327,24 @@ class Bot(discord.Client):
         except discord.HTTPException:
             log.warning("Could not unarchive thread %s", destination_id)
 
+    async def discord_upload_limit(self, bridge: sqlite3.Row) -> int:
+        channel_id = webhook_channel_id(bridge)
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except discord.HTTPException as error:
+                log.warning(
+                    "Could not determine Discord upload limit for channel %s; "
+                    "using %d bytes: %s",
+                    channel_id,
+                    DISCORD_FILE_LIMIT_BYTES,
+                    error,
+                )
+                return DISCORD_FILE_LIMIT_BYTES
+        guild = getattr(channel, "guild", None)
+        return int(guild.filesize_limit) if guild is not None else DISCORD_FILE_LIMIT_BYTES
+
     async def send_via_webhook(
         self, bridge: sqlite3.Row, *, refresh: bool = False, **payload
     ) -> discord.WebhookMessage:
@@ -3432,6 +3450,11 @@ class Bot(discord.Client):
         text = groupme_message_text(message)
         image_urls = groupme_image_urls(message)
         video_urls = groupme_video_urls(message)
+        video_limit = (
+            await self.discord_upload_limit(bridge)
+            if video_urls
+            else DISCORD_FILE_LIMIT_BYTES
+        )
         if not text and not image_urls and not video_urls:
             log.info(
                 "Ignoring GroupMe message %s from group %s via %s: no text or media",
@@ -3458,11 +3481,18 @@ class Bot(discord.Client):
                     self.groupme_session,
                     video_urls,
                     max(0, MAX_DISCORD_FILES - len(files)),
+                    video_limit,
                 )
                 files.extend(videos)
                 if failed_videos:
-                    fallback = "\n".join(f"Video: {url}" for url in failed_videos)
-                    text = truncate("\n".join(part for part in (text, fallback) if part))
+                    fallback_urls = list(
+                        dict.fromkeys(url for url in failed_videos if url not in text)
+                    )
+                    if fallback_urls:
+                        fallback = "\n".join(f"Video: {url}" for url in fallback_urls)
+                        text = truncate(
+                            "\n".join(part for part in (text, fallback) if part)
+                        )
                 if not text and not files:
                     log.warning(
                         "GroupMe message %s had media that could not be downloaded",

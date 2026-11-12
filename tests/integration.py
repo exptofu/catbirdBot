@@ -667,18 +667,21 @@ async def main():
             assert sent_payloads[-1]["avatar_url"] is None
             assert sent_payloads[-1]["content"] == "should not appear"
 
+            video_url = "http://127.0.0.1:8731/cdn/video.mp4"
             video_message = {
                 "id": "9602",
                 "group_id": "G1",
                 "sender_type": "user",
                 "user_id": "u2",
                 "name": "Ann",
+                "text": video_url,
                 "attachments": [
-                    {"type": "video", "url": "http://127.0.0.1:8731/cdn/video.mp4"}
+                    {"type": "video", "url": video_url}
                 ],
                 "created_at": now_epoch,
             }
             await bot.client.process_groupme_message(video_message, source="test")
+            assert sent_payloads[-1]["content"] is None
             video_file = sent_payloads[-1]["files"][0]
             assert video_file.filename == "groupme-video-1.mp4", video_file.filename
             assert video_file.fp.read() == VIDEO_BYTES
@@ -692,7 +695,6 @@ async def main():
             UploadGuild.filesize_limit = 50 * 1024 * 1024
             assert await bot.client.discord_upload_limit(bridge) == 50 * 1024 * 1024
 
-            video_url = video_message["attachments"][0]["url"]
             original_downloader = bot.download_groupme_videos
 
             async def fail_video_download(session, urls, max_files, max_bytes):
@@ -701,7 +703,7 @@ async def main():
             bot.download_groupme_videos = fail_video_download
             try:
                 await bot.client.process_groupme_message(
-                    dict(video_message, id="9605"), source="test"
+                    dict(video_message, id="9605", text=""), source="test"
                 )
                 assert sent_payloads[-1]["files"] == []
                 assert (

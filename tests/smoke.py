@@ -164,6 +164,12 @@ video_message = {
 }
 assert bot.groupme_video_urls(video_message) == ["https://v.groupme.com/clip.mp4"]
 assert bot.groupme_message_text(video_message) == ""
+video_url = "https://v.groupme.com/clip.mp4"
+assert bot.strip_uploaded_video_urls(video_url, [video_url]) == ""
+assert bot.strip_uploaded_video_urls(f"Watch this:\n{video_url}", [video_url]) == "Watch this:"
+assert (
+    bot.strip_uploaded_video_urls(f"[{video_url}]({video_url})", [video_url]) == ""
+)
 assert bot.groupme_message_text({"attachments": [{"type": "video"}]}) == "[video]"
 assert bot.groupme_message_text(
     {"attachments": [{"type": "video", "url": "not-a-url"}]}

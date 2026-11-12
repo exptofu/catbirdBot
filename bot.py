@@ -1236,6 +1236,19 @@ def groupme_video_urls(message: dict) -> list[str]:
     return urls
 
 
+def strip_uploaded_video_urls(text: str, urls: list[str]) -> str:
+    for url in urls:
+        link = re.compile(rf"\[([^\]]*)\]\({re.escape(url)}\)")
+        text = link.sub(
+            lambda match: "" if match.group(1).strip() == url else match.group(1),
+            text,
+        )
+        text = text.replace(f"<{url}>", "").replace(url, "")
+    text = WHITESPACE_RE.sub(" ", text)
+    text = re.sub(r"[ \t]+\n|\n[ \t]+", "\n", text)
+    return text.strip()
+
+
 def is_groupme_bot_message(message: dict) -> bool:
     """True for system messages, bot messages, and anything without a real user."""
     if message.get("system"):
@@ -3490,6 +3503,10 @@ class Bot(discord.Client):
                     video_limit,
                 )
                 files.extend(videos)
+                uploaded_video_urls = [
+                    url for url in video_urls if url not in failed_videos
+                ]
+                text = strip_uploaded_video_urls(text, uploaded_video_urls)
                 if failed_videos:
                     fallback_urls = list(
                         dict.fromkeys(url for url in failed_videos if url not in text)

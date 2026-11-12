@@ -108,6 +108,7 @@ GROUPME_TEXT_LIMIT = 1000
 MAX_GROUPME_IMAGES = 10
 MAX_DISCORD_FILES = 10
 DISCORD_FILE_LIMIT_BYTES = 8 * 1024 * 1024
+DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 # Images are re-encoded down to this budget before being uploaded to GroupMe's
 # image service, and are downscaled to IMAGE_MAX_DIMENSION on the long edge.
 IMAGE_UPLOAD_LIMIT_BYTES = int(os.environ.get("IMAGE_UPLOAD_LIMIT_BYTES", str(8 * 1024 * 1024)))
@@ -3338,12 +3339,17 @@ class Bot(discord.Client):
                     "Could not determine Discord upload limit for channel %s; "
                     "using %d bytes: %s",
                     channel_id,
-                    DISCORD_FILE_LIMIT_BYTES,
+                    DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES,
                     error,
                 )
-                return DISCORD_FILE_LIMIT_BYTES
+                return DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES
         guild = getattr(channel, "guild", None)
-        return int(guild.filesize_limit) if guild is not None else DISCORD_FILE_LIMIT_BYTES
+        if guild is None:
+            return DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES
+        return max(
+            DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES,
+            int(guild.filesize_limit),
+        )
 
     async def send_via_webhook(
         self, bridge: sqlite3.Row, *, refresh: bool = False, **payload
@@ -3453,7 +3459,7 @@ class Bot(discord.Client):
         video_limit = (
             await self.discord_upload_limit(bridge)
             if video_urls
-            else DISCORD_FILE_LIMIT_BYTES
+            else DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES
         )
         if not text and not image_urls and not video_urls:
             log.info(

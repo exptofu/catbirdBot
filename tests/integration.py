@@ -683,35 +683,36 @@ async def main():
             assert video_file.filename == "groupme-video-1.mp4", video_file.filename
             assert video_file.fp.read() == VIDEO_BYTES
 
-            original_file_limit = bot.DISCORD_FILE_LIMIT_BYTES
-            bot.DISCORD_FILE_LIMIT_BYTES = len(VIDEO_BYTES) - 1
-            try:
-                await bot.client.process_groupme_message(
-                    dict(video_message, id="9604"), source="test"
-                )
-                assert len(sent_payloads[-1]["files"]) == 1
-                assert sent_payloads[-1]["files"][0].filename == "groupme-video-1.mp4"
-            finally:
-                bot.DISCORD_FILE_LIMIT_BYTES = original_file_limit
+            bridge = bot.bridge_for_conversation("G1")
+            UploadGuild.filesize_limit = 10 * 1024 * 1024
+            assert (
+                await bot.client.discord_upload_limit(bridge)
+                == bot.DISCORD_DEFAULT_UPLOAD_LIMIT_BYTES
+            )
+            UploadGuild.filesize_limit = 50 * 1024 * 1024
+            assert await bot.client.discord_upload_limit(bridge) == 50 * 1024 * 1024
 
             video_url = video_message["attachments"][0]["url"]
-            UploadGuild.filesize_limit = len(VIDEO_BYTES) - 1
-            bot.DISCORD_FILE_LIMIT_BYTES = len(VIDEO_BYTES) + 1
+            original_downloader = bot.download_groupme_videos
+
+            async def fail_video_download(session, urls, max_files, max_bytes):
+                return [], urls
+
+            bot.download_groupme_videos = fail_video_download
             try:
                 await bot.client.process_groupme_message(
                     dict(video_message, id="9605"), source="test"
                 )
                 assert sent_payloads[-1]["files"] == []
                 assert (
-                    sent_payloads[-1]["content"]
-                    == f"Video: {video_url}"
+                    sent_payloads[-1]["content"] == f"Video: {video_url}"
                 )
                 await bot.client.process_groupme_message(
                     dict(video_message, id="9606", text=video_url), source="test"
                 )
                 assert sent_payloads[-1]["content"] == video_url
             finally:
-                bot.DISCORD_FILE_LIMIT_BYTES = original_file_limit
+                bot.download_groupme_videos = original_downloader
                 UploadGuild.filesize_limit = 25 * 1024 * 1024
 
             LATEST_MESSAGES[:] = [

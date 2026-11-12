@@ -1082,6 +1082,7 @@ def groupme_reply_quote(attachment: dict) -> str:
         return "> (replying to a GroupMe user who opted out of Discord sharing)"
     if privacy == PRIVACY_ANONYMIZE and name:
         name = ANONYMOUS_GROUPME_NAME
+    quoted = render_groupme_mentions(quoted, attachment.get("attachments"))
     quoted = truncate(strip_emoji(CUSTOM_EMOJI_RE.sub("", quoted)), 120)
     if name and quoted:
         return f"> {name}: {quoted}"
@@ -1090,6 +1091,62 @@ def groupme_reply_quote(attachment: dict) -> str:
     if quoted:
         return f"> {quoted}"
     return "> (GroupMe reply)"
+
+
+async def resolve_groupme_reply(
+    session: aiohttp.ClientSession, conversation_id: str, message: dict
+) -> dict:
+    attachments = message.get("attachments") or []
+    unresolved = [
+        attachment
+        for attachment in attachments
+        if (attachment.get("type") or "").lower() == "reply"
+        and attachment.get("reply_id")
+        and (
+            not (attachment.get("text") or "").strip()
+            or not (attachment.get("name") or "").strip()
+        )
+    ]
+    if not unresolved or not GROUPME_ACCESS_TOKEN:
+        return message
+
+    try:
+        recent_messages = await groupme_list_messages(
+            session, conversation_id, limit=100
+        )
+    except GroupMeError as error:
+        log.warning(
+            "Could not look up quoted GroupMe message(s) for %s: %s",
+            message.get("id"),
+            error,
+        )
+        return message
+
+    targets = {
+        str(target.get("id")): target
+        for target in recent_messages
+        if target.get("id")
+    }
+    enriched = dict(message)
+    enriched_attachments = [dict(attachment) for attachment in attachments]
+    changed = False
+    for attachment in enriched_attachments:
+        target = targets.get(str(attachment.get("reply_id") or ""))
+        if target is None:
+            continue
+        if not (attachment.get("text") or "").strip():
+            attachment["text"] = target.get("text") or ""
+            changed = True
+        if not (attachment.get("name") or "").strip():
+            attachment["name"] = target.get("name") or ""
+            changed = True
+        if not attachment.get("attachments") and target.get("attachments"):
+            attachment["attachments"] = target["attachments"]
+            changed = True
+    if changed:
+        enriched["attachments"] = enriched_attachments
+        return enriched
+    return message
 
 
 def render_groupme_mentions(text: str, attachments: list[dict] | None) -> str:
@@ -1139,6 +1196,7 @@ def groupme_message_text(message: dict) -> str:
         parts.append(text)
     for attachment in attachments:
         kind = (attachment.get("type") or "").lower()
+        video_url = attachment.get("url")
         if kind == "location":
             label = attachment.get("name") or "Location"
             lat, lng = attachment.get("lat"), attachment.get("lng")
@@ -1149,6 +1207,10 @@ def groupme_message_text(message: dict) -> str:
         elif kind == "reply":
             # Quoted first, like a Discord reply, so the context reads before the answer.
             quotes.append(groupme_reply_quote(attachment))
+        elif kind == "video" and isinstance(video_url, str) and video_url.startswith(
+            ("http://", "https://")
+        ):
+            continue
         elif kind not in {"image", "emoji", "mentions"}:
             parts.append(f"[{kind or 'attachment'}]")
     body = "\n".join(parts).strip()
@@ -1160,6 +1222,16 @@ def groupme_image_urls(message: dict) -> list[str]:
     for attachment in message.get("attachments") or []:
         if (attachment.get("type") or "").lower() == "image" and attachment.get("url"):
             urls.append(attachment["url"])
+    return urls
+
+
+def groupme_video_urls(message: dict) -> list[str]:
+    urls = []
+    for attachment in message.get("attachments") or []:
+        url = attachment.get("url")
+        if (attachment.get("type") or "").lower() == "video" and isinstance(url, str):
+            if url.startswith(("http://", "https://")):
+                urls.append(url)
     return urls
 
 
@@ -1241,6 +1313,42 @@ async def download_groupme_images(
         except (aiohttp.ClientError, asyncio.TimeoutError):
             log.exception("Download of GroupMe image %s failed", url)
     return files
+
+
+async def download_groupme_videos(
+    session: aiohttp.ClientSession, urls: list[str], max_files: int
+) -> tuple[list[discord.File], list[str]]:
+    files: list[discord.File] = []
+    failed_urls = urls[max_files:]
+    video_types = {"video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm"}
+    for index, url in enumerate(urls[:max_files], start=1):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                if response.status != 200:
+                    log.warning(
+                        "Could not download GroupMe video %s (%s)", url, response.status
+                    )
+                    failed_urls.append(url)
+                    continue
+                data = await read_body_limited(response, DISCORD_FILE_LIMIT_BYTES)
+                if data is None:
+                    log.warning(
+                        "Skipping GroupMe video %s: larger than %d bytes",
+                        url,
+                        DISCORD_FILE_LIMIT_BYTES,
+                    )
+                    failed_urls.append(url)
+                    continue
+                extension = video_types.get(response.content_type or "", "mp4")
+                files.append(
+                    discord.File(
+                        io.BytesIO(data), filename=f"groupme-video-{index}.{extension}"
+                    )
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            log.exception("Download of GroupMe video %s failed", url)
+            failed_urls.append(url)
+    return files, failed_urls
 
 
 async def download_discord_image(
@@ -3318,11 +3426,15 @@ class Bot(discord.Client):
             )
             return
 
+        message = await resolve_groupme_reply(
+            self.groupme_session, group_id, message
+        )
         text = groupme_message_text(message)
         image_urls = groupme_image_urls(message)
-        if not text and not image_urls:
+        video_urls = groupme_video_urls(message)
+        if not text and not image_urls and not video_urls:
             log.info(
-                "Ignoring GroupMe message %s from group %s via %s: no text and no images",
+                "Ignoring GroupMe message %s from group %s via %s: no text or media",
                 message_id,
                 group_id,
                 source,
@@ -3337,12 +3449,23 @@ class Bot(discord.Client):
             avatar_url = message.get("avatar_url") or None
         sent: discord.WebhookMessage | None = None
         files: list[discord.File] = []
+        videos: list[discord.File] = []
+        failed_videos = video_urls
         for attempt in (1, 2):
             try:
                 files = await download_groupme_images(self.groupme_session, image_urls)
+                videos, failed_videos = await download_groupme_videos(
+                    self.groupme_session,
+                    video_urls,
+                    max(0, MAX_DISCORD_FILES - len(files)),
+                )
+                files.extend(videos)
+                if failed_videos:
+                    fallback = "\n".join(f"Video: {url}" for url in failed_videos)
+                    text = truncate("\n".join(part for part in (text, fallback) if part))
                 if not text and not files:
                     log.warning(
-                        "GroupMe message %s had images that could not be downloaded",
+                        "GroupMe message %s had media that could not be downloaded",
                         message_id,
                     )
                     return
@@ -3380,11 +3503,13 @@ class Bot(discord.Client):
         )
         set_last_seen(group_id, message_id)
         log.info(
-            "Relayed GroupMe message %s from group %s to channel %s (%d image(s), via %s)",
+            "Relayed GroupMe message %s from group %s to channel %s "
+            "(%d image(s), %d video(s), via %s)",
             message_id,
             group_id,
             bridge["channel_id"],
-            len(files),
+            len(files) - len(videos),
+            len(videos),
             source,
         )
 

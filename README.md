@@ -9,7 +9,7 @@ A two-way bridge between GroupMe and Discord. Each GroupMe conversation — a gr
 - **Forum posts** behave like any other destination: GroupMe messages arrive through the webhook that lives on the forum channel, and an archived post is unarchived automatically before the next message.
 - **Both directions**: main-chat bridges post with a GroupMe bot; topic bridges post with the access token; GroupMe messages are posted through a per-channel Discord webhook so the original name and avatar are preserved.
 - **No bot required**: when a group refuses bot creation (GroupMe answers `401` for that group, even in its own UI), the bridge falls back to posting with `GROUPME_ACCESS_TOKEN` and polls the group every `GROUPME_POLL_SECONDS` instead of relying on callbacks.
-- **Photos**: GroupMe images are downloaded and re-uploaded as Discord attachments; Discord images are downloaded, compressed, and re-hosted on GroupMe's image service for both group and topic bridges. GroupMe rejects non-GroupMe image URLs (`invalid origin`), so an image that cannot be re-hosted is skipped and the message notes how many were dropped.
+- **Photos and videos**: GroupMe images and videos are downloaded and attached in Discord; videos that exceed Discord's upload limit remain as links. Discord images are downloaded, compressed, and re-hosted on GroupMe's image service for both group and topic bridges. GroupMe rejects non-GroupMe image URLs (`invalid origin`), so an image that cannot be re-hosted is skipped and the message notes how many were dropped.
 - **No bot echo**: bot messages are skipped on both sides, and token posts are tracked so they are not mirrored back.
 - **Deletion sync**: deleting a bridged Discord message deletes the GroupMe message(s) it produced; deleting a GroupMe message removes its Discord copy. Set `SYNC_DELETIONS=false` to turn this off.
 
@@ -193,16 +193,16 @@ Privacy settings are **bridge-wide** and keyed by the GroupMe **display name**, 
 
 - `share` (default) mirrors the display name and avatar as before.
 - `anonymize` relays the message as **GroupMe user** with no avatar. The text itself is unchanged.
-- `opt out` does not relay that display name's messages at all; images are not downloaded.
+- `opt out` does not relay that display name's messages at all; images and videos are not downloaded.
 
-`/privacy set name:<display name> mode:<share|anonymize|opt out>` manages a rule and `/privacy list` summarizes the current ones. Quoted replies only expose a name when GroupMe includes one: current payloads often carry neither `name` nor `text` and render as `> (GroupMe reply)`, so there is nothing to anonymize on that path. When a quote does carry a name, an anonymized one becomes `GroupMe user` and an opted-out one loses both the name and the quoted text (the reply's own text is still relayed).
+`/privacy set name:<display name> mode:<share|anonymize|opt out>` manages a rule and `/privacy list` summarizes the current ones. When a GroupMe reply omits its quoted name or text, the bridge looks up the referenced message in recent history; if it is unavailable, the quote falls back to `> (GroupMe reply)`. An anonymized quoted user becomes `GroupMe user`, and an opted-out quoted user loses both the name and quoted text (the reply's own text is still relayed).
 
 ## Behaviour notes
 
 - GroupMe text is capped at 1,000 characters. Longer Discord messages are truncated and, when possible, keep their trailing links.
 - Discord replies are relayed with a quoted snippet. Every Discord message starts with `Nickname:` (including picture-only posts, which are separate bot messages), so GroupMe members can see who typed. User and role mentions become `@Name` and channel mentions become `#name`, because GroupMe does not render Discord markup. A user mention uses the member's **server nickname** (the guild cache is checked first and uncached members are fetched from Discord), never the account username, so GroupMe sees the same name the member shows in the server. Emoji are stripped: custom Discord emoji have no GroupMe equivalent and unicode emoji are not relayed.
 - GroupMe messages keep the sender's name and avatar through the channel webhook, and their text is relayed exactly as sent: since every destination mirrors a single conversation, no channel or topic prefix is added. The Discord → GroupMe direction is delineated with `Nickname:` leading every message.
-- GroupMe replies are relayed as a Markdown quote above the text, `> Ann: meet at 7?`, mirroring how Discord replies reach GroupMe. When GroupMe omits the quoted text the line becomes `> Replying to Ann`.
+- GroupMe replies are relayed as a Markdown quote above the text, `> Ann: meet at 7?`, mirroring how Discord replies reach GroupMe. If GroupMe omits the quoted text, the bridge looks up the referenced message in recent history.
 - Forum posts and threads have no webhook of their own: the bridge creates the webhook on the parent forum/text channel and passes the thread id when posting. An archived post is unarchived before the message is sent.
 - GroupMe messages are mirrored with `AllowedMentions.none()`, so `@everyone` in GroupMe cannot ping Discord.
 - Bot filtering: Discord messages with `author.bot` or a `webhook_id` are skipped (the bridge's own webhooks included). GroupMe messages with `system: true`, `sender_type` other than `user`, no `user_id`, or a name matching a bot owned by the access token are skipped, so give each bridge bot a distinctive name.

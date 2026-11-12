@@ -159,6 +159,15 @@ groupme_message = {
 assert bot.groupme_image_urls(groupme_message) == ["https://i.groupme.com/a"]
 assert "maps.google.com" in bot.groupme_message_text(groupme_message)
 assert bot.groupme_message_text({"attachments": [{"type": "image", "url": "x"}]}) == ""
+video_message = {
+    "attachments": [{"type": "video", "url": "https://v.groupme.com/clip.mp4"}]
+}
+assert bot.groupme_video_urls(video_message) == ["https://v.groupme.com/clip.mp4"]
+assert bot.groupme_message_text(video_message) == ""
+assert bot.groupme_message_text({"attachments": [{"type": "video"}]}) == "[video]"
+assert bot.groupme_message_text(
+    {"attachments": [{"type": "video", "url": "not-a-url"}]}
+) == "[video]"
 
 # GroupMe replies render as a blockquote instead of a bare [reply] marker
 reply = {

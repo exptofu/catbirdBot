@@ -15,6 +15,7 @@ UPLOADS = []
 CALLS = []
 DELETED_MESSAGES = []
 LATEST_MESSAGES = []
+VIDEO_BYTES = b"test video bytes"
 
 
 def build_big_png():
@@ -124,6 +125,10 @@ async def pictures(request):
 
 async def cdn(request):
     return web.Response(body=BIG_PNG, content_type="image/png")
+
+
+async def video_cdn(request):
+    return web.Response(body=VIDEO_BYTES, content_type="video/mp4")
 
 
 async def message_delete(request):
@@ -284,6 +289,7 @@ async def main():
     app.router.add_get("/groups", group_index)
     app.router.add_post("/images/pictures", pictures)
     app.router.add_get("/cdn/a.png", cdn)
+    app.router.add_get("/cdn/video.mp4", video_cdn)
     app.router.add_get("/flaky", flaky)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -651,6 +657,62 @@ async def main():
             assert sent_payloads[-1]["username"] == bot.ANONYMOUS_GROUPME_NAME
             assert sent_payloads[-1]["avatar_url"] is None
             assert sent_payloads[-1]["content"] == "should not appear"
+
+            video_message = {
+                "id": "9602",
+                "group_id": "G1",
+                "sender_type": "user",
+                "user_id": "u2",
+                "name": "Ann",
+                "attachments": [
+                    {"type": "video", "url": "http://127.0.0.1:8731/cdn/video.mp4"}
+                ],
+                "created_at": now_epoch,
+            }
+            await bot.client.process_groupme_message(video_message, source="test")
+            video_file = sent_payloads[-1]["files"][0]
+            assert video_file.filename == "groupme-video-1.mp4", video_file.filename
+            assert video_file.fp.read() == VIDEO_BYTES
+
+            original_file_limit = bot.DISCORD_FILE_LIMIT_BYTES
+            bot.DISCORD_FILE_LIMIT_BYTES = len(VIDEO_BYTES) - 1
+            try:
+                await bot.client.process_groupme_message(
+                    dict(video_message, id="9604"), source="test"
+                )
+                assert sent_payloads[-1]["files"] == []
+                assert (
+                    sent_payloads[-1]["content"]
+                    == "Video: http://127.0.0.1:8731/cdn/video.mp4"
+                )
+            finally:
+                bot.DISCORD_FILE_LIMIT_BYTES = original_file_limit
+
+            LATEST_MESSAGES[:] = [
+                {
+                    "id": "9599",
+                    "group_id": "G1",
+                    "sender_type": "user",
+                    "user_id": "u3",
+                    "name": "Bea",
+                    "text": "the quoted original",
+                    "created_at": now_epoch - 1,
+                }
+            ]
+            await bot.client.process_groupme_message(
+                {
+                    "id": "9603",
+                    "group_id": "G1",
+                    "sender_type": "user",
+                    "user_id": "u2",
+                    "name": "Ann",
+                    "text": "my reply",
+                    "attachments": [{"type": "reply", "reply_id": "9599"}],
+                    "created_at": now_epoch,
+                },
+                source="test",
+            )
+            assert sent_payloads[-1]["content"] == "> Bea: the quoted original\nmy reply"
         finally:
             bot.client.send_via_webhook = original_send
             bot.set_groupme_user_mode("Quiet Person", bot.PRIVACY_SHARE)

@@ -1062,7 +1062,7 @@ def quoted_reply(message: discord.Message) -> str:
     snippet = truncate(CUSTOM_EMOJI_RE.sub("", reference.clean_content or ""), 120)
     if not snippet:
         return ""
-    return f"> {snippet}\n"
+    return f'"{snippet}"\n'
 
 
 def groupme_reply_quote(attachment: dict) -> str:

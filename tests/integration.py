@@ -440,7 +440,7 @@ async def main():
         reply.reference = SimpleNamespace(resolved=original_message)
         POSTED_BOT.clear()
         await bot.relay_discord_message(session, reply, bot.bridge_for_conversation("G1"))
-        assert POSTED_BOT[0]["text"] == "> the quoted original 🎉\nAnn: my reply 🎉", POSTED_BOT[0]
+        assert POSTED_BOT[0]["text"] == '"the quoted original 🎉"\nAnn: my reply 🎉', POSTED_BOT[0]
 
         # a stale bot id is repaired from the account and the post retried
         bot.save_bridge("G1", 555, "stale-bot", "Testers", group_name="Testers")

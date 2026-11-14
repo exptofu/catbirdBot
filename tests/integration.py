@@ -4,6 +4,8 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import discord
 from aiohttp import web
@@ -427,6 +429,18 @@ async def main():
         assert POSTED_BOT[1] == {"bot_id": "bot-1", "text": "Ann:", "picture_url": "https://i.groupme.com/test.jpg"}, POSTED_BOT[1]
         assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
         assert max(UPLOADS[0]["dims"]) <= 2048, UPLOADS[0]
+
+        original_message = Mock(spec=discord.Message)
+        original_message.clean_content = "the quoted original 🎉"
+        original_message.author = Author()
+        reply = Message()
+        reply.id = 1002
+        reply.content = "my reply 🎉"
+        reply.attachments = []
+        reply.reference = SimpleNamespace(resolved=original_message)
+        POSTED_BOT.clear()
+        await bot.relay_discord_message(session, reply, bot.bridge_for_conversation("G1"))
+        assert POSTED_BOT[0]["text"] == "> the quoted original 🎉\nAnn: my reply 🎉", POSTED_BOT[0]
 
         # a stale bot id is repaired from the account and the post retried
         bot.save_bridge("G1", 555, "stale-bot", "Testers", group_name="Testers")

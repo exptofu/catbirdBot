@@ -968,8 +968,7 @@ CUSTOM_EMOJI_RE = re.compile(r"<a?:(\w+):\d+>")
 USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
 ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
 CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
-# Emoji are dropped on the way to GroupMe: custom Discord emoji have no meaning
-# there and unicode emoji are not requested by the server owner.
+# Custom Discord emoji markup has no meaning in GroupMe; Unicode emoji pass through.
 UNICODE_EMOJI_RE = re.compile(
     "["
     "\U0001f000-\U0001faff"  # pictographs, symbols, flags, supplemental
@@ -1033,8 +1032,8 @@ def render_discord_content(
 ) -> str:
     """Rewrite Discord mention syntax into text GroupMe members can read.
 
-    Users and roles become `@Name`, channels become `#name`, and emoji are
-    removed instead of being passed through as unreadable markup. `names` carries
+    Users and roles become `@Name`, channels become `#name`, and custom emoji
+    markup is removed while Unicode emoji are preserved. `names` carries
     the server nicknames from `resolve_mention_names`, which also covers mentions
     discord.py did not resolve into `message.mentions`.
     """
@@ -1052,7 +1051,6 @@ def render_discord_content(
     text = USER_MENTION_RE.sub(r"@user", text)
     text = ROLE_MENTION_RE.sub(r"@role", text)
     text = CHANNEL_MENTION_RE.sub(r"#channel", text)
-    text = strip_emoji(text)
     text = WHITESPACE_RE.sub(" ", text)
     return text.strip()
 
@@ -1061,10 +1059,10 @@ def quoted_reply(message: discord.Message) -> str:
     reference = message.reference.resolved if message.reference else None
     if not isinstance(reference, discord.Message):
         return ""
-    snippet = truncate(strip_emoji(CUSTOM_EMOJI_RE.sub("", reference.clean_content or "")), 120)
+    snippet = truncate(CUSTOM_EMOJI_RE.sub("", reference.clean_content or ""), 120)
     if not snippet:
         return ""
-    return f"> {reference.author.display_name}: {snippet}\n"
+    return f"> {snippet}\n"
 
 
 def groupme_reply_quote(attachment: dict) -> str:
@@ -1570,7 +1568,7 @@ async def relay_discord_message(
     header = f"{name}:"
     quote = quoted_reply(message)
     if quote:
-        body = f"{header}\n{quote}{text}".rstrip()
+        body = f"{quote}{header} {text}".rstrip()
     else:
         body = f"{header} {text}".rstrip()
     if links:

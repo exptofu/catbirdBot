@@ -3630,6 +3630,16 @@ class Bot(discord.Client):
                 return None
             if privacy == PRIVACY_ANONYMIZE:
                 name = ANONYMOUS_GROUPME_NAME
+        else:
+            guild = getattr(channel, "guild", None)
+            member = guild.get_member(original.author.id) if guild is not None else None
+            if member is None and guild is not None:
+                try:
+                    member = await guild.fetch_member(original.author.id)
+                except discord.HTTPException:
+                    member = None
+            if member is not None:
+                name = member.display_name or member.name
 
         guild_id = getattr(getattr(channel, "guild", None), "id", None)
         if guild_id is None:

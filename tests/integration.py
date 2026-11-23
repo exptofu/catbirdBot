@@ -811,6 +811,12 @@ async def main():
             filesize_limit = 25 * 1024 * 1024
             id = 123456
 
+            def get_member(self, user_id):
+                return None
+
+            async def fetch_member(self, user_id):
+                return NickMember(user_id, "Nick Name", name="Universal Nickname")
+
         class UploadChannel:
             guild = UploadGuild()
             messages = {}
@@ -830,7 +836,11 @@ async def main():
                 webhook_id=123,
             ),
             4249: SimpleNamespace(
-                author=SimpleNamespace(display_name="Nick Name", name="Nick Name"),
+                author=SimpleNamespace(
+                    id=49,
+                    display_name="Universal Nickname",
+                    name="universal",
+                ),
                 clean_content="content",
                 webhook_id=None,
             ),

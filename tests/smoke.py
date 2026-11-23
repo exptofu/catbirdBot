@@ -64,8 +64,20 @@ assert sorted(row["groupme_id"] for row in bot.outbound_messages(2222)) == ["555
 assert bot.outbound_messages(3333) == []
 assert bot.outbound_groupme_id_exists("12345678", "556")
 assert not bot.outbound_groupme_id_exists("12345678", "999")
+assert bot.groupme_message_for_discord_reply("12345678", 2222) == "555"
+assert bot.discord_message_for_groupme_reply("12345678", "555", 111) == ("2222", 111)
 bot.remove_outbound("12345678", 2222, "555")
 assert [row["groupme_id"] for row in bot.outbound_messages(2222)] == ["556"]
+bot.add_link(
+    bot.LINK_GROUPME,
+    "12345678",
+    111,
+    "557",
+    "3333",
+    datetime.now(timezone.utc),
+)
+assert bot.groupme_message_for_discord_reply("12345678", "3333") == "557"
+assert bot.discord_message_for_groupme_reply("12345678", "557", 111) == ("3333", 111)
 bot.remove_link(bot.LINK_GROUPME, "12345678", "555")
 assert not bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 
@@ -184,6 +196,7 @@ reply = {
 }
 rendered_reply = bot.groupme_message_text(reply)
 assert rendered_reply == "> Ann: meet at 7?\nsounds good", rendered_reply
+assert bot.groupme_message_text(reply, include_reply_quote=False) == "sounds good"
 multiline_reply = {
     "text": "pacific loon",
     "attachments": [

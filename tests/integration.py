@@ -464,16 +464,48 @@ async def main():
         assert max(UPLOADS[0]["dims"]) <= 2048, UPLOADS[0]
 
         original_message = Mock(spec=discord.Message)
+        original_message.id = 1001
         original_message.clean_content = "the quoted original 🎉"
         original_message.author = Author()
+        bot.add_link(
+            bot.LINK_GROUPME,
+            "G1",
+            555,
+            "9590",
+            "1001",
+            datetime.now(timezone.utc),
+        )
         reply = Message()
         reply.id = 1002
         reply.content = "my reply 🎉"
         reply.attachments = []
-        reply.reference = SimpleNamespace(resolved=original_message)
+        reply.reference = SimpleNamespace(message_id=1001, resolved=original_message)
         POSTED_BOT.clear()
         await bot.relay_discord_message(session, reply, bot.bridge_for_conversation("G1"))
-        assert POSTED_BOT[0]["text"] == '"the quoted original 🎉"\nAnn: my reply 🎉', POSTED_BOT[0]
+        assert POSTED_BOT[0]["text"] == "Ann: my reply 🎉", POSTED_BOT[0]
+        assert POSTED_BOT[0]["attachments"] == [
+            {"type": "reply", "reply_id": "9590", "base_reply_id": "9590"}
+        ], POSTED_BOT[0]
+
+        # If the referenced message is not mapped, preserve the quoted-text fallback.
+        POSTED_BOT.clear()
+        reply.reference = SimpleNamespace(
+            message_id=2001, resolved=original_message
+        )
+        await bot.relay_discord_message(session, reply, bot.bridge_for_conversation("G1"))
+        assert POSTED_BOT[0]["text"] == '"the quoted original 🎉"\nAnn: my reply 🎉'
+        assert "attachments" not in POSTED_BOT[0]
+
+        # A Discord-origin parent is resolved through its outbound GroupMe mapping too.
+        bot.add_outbound("G1", 1003, "9591", datetime.now(timezone.utc))
+        reply.id = 1004
+        reply.reference = SimpleNamespace(message_id=1003, resolved=original_message)
+        POSTED_BOT.clear()
+        await bot.relay_discord_message(session, reply, bot.bridge_for_conversation("G1"))
+        assert POSTED_BOT[0]["text"] == "Ann: my reply 🎉"
+        assert POSTED_BOT[0]["attachments"] == [
+            {"type": "reply", "reply_id": "9591", "base_reply_id": "9591"}
+        ], POSTED_BOT[0]
 
         # a stale bot id is repaired from the account and the post retried
         bot.save_bridge("G1", 555, "stale-bot", "Testers", group_name="Testers")
@@ -529,6 +561,26 @@ async def main():
         assert POSTED_MESSAGE[0]["group_id"] == "G3", POSTED_MESSAGE[0]
         assert POSTED_MESSAGE[0]["text"].startswith("Ann: hello group"), POSTED_MESSAGE[0]
         assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
+        bot.add_link(
+            bot.LINK_GROUPME,
+            "G3",
+            888,
+            "9580",
+            "7777",
+            datetime.now(timezone.utc),
+        )
+        user_reply = Message()
+        user_reply.id = 1005
+        user_reply.reference = SimpleNamespace(message_id=7777)
+        POSTED_MESSAGE.clear()
+        await bot.relay_discord_message(
+            session, user_reply, bot.bridge_for_conversation("G3")
+        )
+        assert any(
+            attachment.get("type") == "reply"
+            and attachment.get("reply_id") == "9580"
+            for attachment in POSTED_MESSAGE[-1]["attachments"]
+        ), POSTED_MESSAGE[-1]
         # token posts return their message id, so the Discord message can be deleted later
         assert [row["groupme_id"] for row in bot.outbound_messages(Message.id)] == [
             "9001",
@@ -757,6 +809,7 @@ async def main():
 
         class UploadGuild:
             filesize_limit = 25 * 1024 * 1024
+            id = 123456
 
         class UploadChannel:
             guild = UploadGuild()
@@ -847,6 +900,14 @@ async def main():
                     "created_at": now_epoch - 1,
                 }
             ]
+            bot.add_link(
+                bot.LINK_GROUPME,
+                "G1",
+                555,
+                "9599",
+                "4247",
+                datetime.now(timezone.utc),
+            )
             await bot.client.process_groupme_message(
                 {
                     "id": "9603",
@@ -860,7 +921,130 @@ async def main():
                 },
                 source="test",
             )
-            assert sent_payloads[-1]["content"] == "> Bea: the quoted original\nmy reply"
+            assert sent_payloads[-1]["content"] == "my reply"
+            reply_view = sent_payloads[-1]["view"]
+            assert len(reply_view.children) == 2, reply_view.children
+            assert reply_view.children[0].label == "Reply To: Bea"
+            assert reply_view.children[0].disabled
+            assert reply_view.children[1].label == "the quoted original"
+            assert reply_view.children[1].url == (
+                "https://discord.com/channels/123456/555/4247"
+            )
+
+            # A GroupMe reply to a Discord-origin GroupMe post resolves via outbound ids.
+            bot.add_outbound("G1", 4249, "9597", datetime.now(timezone.utc))
+            await bot.client.process_groupme_message(
+                {
+                    "id": "9607",
+                    "group_id": "G1",
+                    "sender_type": "user",
+                    "user_id": "u2",
+                    "name": "Ann",
+                    "text": "reply to discord",
+                    "attachments": [
+                        {
+                            "type": "reply",
+                            "reply_id": "9597",
+                            "name": "Discord author",
+                            "text": "discord-origin parent",
+                        }
+                    ],
+                    "created_at": now_epoch,
+                },
+                source="test",
+            )
+            assert sent_payloads[-1]["content"] == "reply to discord"
+            assert sent_payloads[-1]["view"].children[1].url == (
+                "https://discord.com/channels/123456/555/4249"
+            )
+
+            LATEST_MESSAGES[:] = [
+                {
+                    "id": "9598",
+                    "group_id": "G1",
+                    "sender_type": "user",
+                    "user_id": "u3",
+                    "name": "Bea",
+                    "text": "x" * 100,
+                    "created_at": now_epoch - 1,
+                }
+            ]
+            bot.add_link(
+                bot.LINK_GROUPME,
+                "G1",
+                555,
+                "9598",
+                "4248",
+                datetime.now(timezone.utc),
+            )
+            await bot.client.process_groupme_message(
+                {
+                    "id": "9604",
+                    "group_id": "G1",
+                    "sender_type": "user",
+                    "user_id": "u2",
+                    "name": "Ann",
+                    "text": "another reply",
+                    "attachments": [{"type": "reply", "reply_id": "9598"}],
+                    "created_at": now_epoch,
+                },
+                source="test",
+            )
+            preview_button = sent_payloads[-1]["view"].children[1]
+            assert len(preview_button.label) == 80, preview_button.label
+            assert preview_button.label.endswith("…"), preview_button.label
+
+            # Opted-out referenced names and text are not exposed through a link button.
+            bot.set_groupme_user_mode("Bea", bot.PRIVACY_OPTOUT)
+            assert bot.groupme_user_mode("Bea") == bot.PRIVACY_OPTOUT
+            await bot.client.process_groupme_message(
+                {
+                    "id": "9610",
+                    "group_id": "G1",
+                    "sender_type": "user",
+                    "user_id": "u2",
+                    "name": "Ann",
+                    "text": "private reply",
+                    "attachments": [
+                        {
+                            "type": "reply",
+                            "reply_id": "9599",
+                            "name": "Bea",
+                            "text": "the quoted original",
+                        }
+                    ],
+                    "created_at": now_epoch,
+                },
+                source="test",
+            )
+            assert "view" not in sent_payloads[-1], sent_payloads[-1]
+            assert "Bea" not in sent_payloads[-1]["content"]
+            assert "the quoted original" not in sent_payloads[-1]["content"]
+            bot.set_groupme_user_mode("Bea", bot.PRIVACY_SHARE)
+
+            # Unmapped replies keep the previous quote rendering.
+            await bot.client.process_groupme_message(
+                {
+                    "id": "9611",
+                    "group_id": "G1",
+                    "sender_type": "user",
+                    "user_id": "u2",
+                    "name": "Ann",
+                    "text": "fallback reply",
+                    "attachments": [
+                        {
+                            "type": "reply",
+                            "reply_id": "unmapped",
+                            "name": "Bea",
+                            "text": "unmapped original",
+                        }
+                    ],
+                    "created_at": now_epoch,
+                },
+                source="test",
+            )
+            assert sent_payloads[-1]["content"] == "> Bea: unmapped original\nfallback reply"
+            assert "view" not in sent_payloads[-1]
         finally:
             bot.client.send_via_webhook = original_send
             bot.client.get_channel = original_get_channel

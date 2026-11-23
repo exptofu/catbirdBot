@@ -602,6 +602,58 @@ def outbound_messages(discord_id: str | int) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def groupme_message_for_discord_reply(
+    conversation_id: str, discord_id: str | int
+) -> str | None:
+    """Find the GroupMe counterpart for a Discord message in this conversation."""
+    link = db.execute(
+        """
+        SELECT source_id FROM message_links
+         WHERE direction=? AND group_id=? AND target_id=?
+        """,
+        (LINK_GROUPME, str(conversation_id), str(discord_id)),
+    ).fetchone()
+    if link is not None:
+        return str(link["source_id"])
+
+    outbound = db.execute(
+        """
+        SELECT groupme_id FROM outbound_messages
+         WHERE group_id=? AND discord_id=?
+         ORDER BY created_at LIMIT 1
+        """,
+        (str(conversation_id), str(discord_id)),
+    ).fetchone()
+    return str(outbound["groupme_id"]) if outbound is not None else None
+
+
+def discord_message_for_groupme_reply(
+    conversation_id: str, groupme_id: str, fallback_channel_id: int
+) -> tuple[str, int] | None:
+    """Find the Discord counterpart for a GroupMe message in this conversation."""
+    link = db.execute(
+        """
+        SELECT target_id, channel_id FROM message_links
+         WHERE direction=? AND group_id=? AND source_id=? AND target_id IS NOT NULL
+        """,
+        (LINK_GROUPME, str(conversation_id), str(groupme_id)),
+    ).fetchone()
+    if link is not None:
+        return str(link["target_id"]), int(link["channel_id"] or fallback_channel_id)
+
+    outbound = db.execute(
+        """
+        SELECT discord_id FROM outbound_messages
+         WHERE group_id=? AND groupme_id=?
+         ORDER BY created_at LIMIT 1
+        """,
+        (str(conversation_id), str(groupme_id)),
+    ).fetchone()
+    if outbound is not None:
+        return str(outbound["discord_id"]), int(fallback_channel_id)
+    return None
+
+
 def remove_outbound(group_id: str, discord_id: str | int, groupme_id: str) -> None:
     db.execute(
         "DELETE FROM outbound_messages WHERE group_id=? AND discord_id=? AND groupme_id=?",
@@ -959,11 +1011,17 @@ async def ensure_group_bot(
 
 
 async def groupme_post_bot(
-    session: aiohttp.ClientSession, bot_id: str, text: str, picture_url: str | None = None
+    session: aiohttp.ClientSession,
+    bot_id: str,
+    text: str,
+    picture_url: str | None = None,
+    attachments: list[dict] | None = None,
 ) -> None:
     payload = {"bot_id": bot_id, "text": text}
     if picture_url:
         payload["picture_url"] = picture_url
+    if attachments:
+        payload["attachments"] = attachments
     # GroupMe does not return the created message for bot posts.
     await groupme_request(session, "POST", "/bots/post", json_body=payload)
 
@@ -1132,6 +1190,14 @@ def quoted_reply(message: discord.Message) -> str:
     return f'"{snippet}"\n'
 
 
+def discord_reference_message_id(message: discord.Message) -> int | None:
+    reference = getattr(message, "reference", None)
+    message_id = getattr(reference, "message_id", None)
+    if message_id is None:
+        message_id = getattr(getattr(reference, "resolved", None), "id", None)
+    return int(message_id) if message_id is not None else None
+
+
 def groupme_reply_quote(attachment: dict) -> str:
     """Render a GroupMe `reply` attachment as a Markdown blockquote.
 
@@ -1253,7 +1319,7 @@ def render_groupme_mentions(text: str, attachments: list[dict] | None) -> str:
     return rendered
 
 
-def groupme_message_text(message: dict) -> str:
+def groupme_message_text(message: dict, *, include_reply_quote: bool = True) -> str:
     parts: list[str] = []
     quotes: list[str] = []
     attachments = message.get("attachments") or []
@@ -1272,8 +1338,9 @@ def groupme_message_text(message: dict) -> str:
         elif kind == "split":
             parts.append("(GroupMe poll split)")
         elif kind == "reply":
-            # Quoted first, like a Discord reply, so the context reads before the answer.
-            quotes.append(groupme_reply_quote(attachment))
+            if include_reply_quote:
+                # Keep quoted context when the original has no mapped Discord copy.
+                quotes.append(groupme_reply_quote(attachment))
         elif kind == "video" and isinstance(video_url, str) and video_url.startswith(
             ("http://", "https://")
         ):
@@ -1282,6 +1349,23 @@ def groupme_message_text(message: dict) -> str:
             parts.append(f"[{kind or 'attachment'}]")
     body = "\n".join(parts).strip()
     return truncate("\n".join(quotes + ([body] if body else [])))
+
+
+def groupme_reply_attachment_for_discord_message(
+    message: discord.Message, conversation_id: str
+) -> dict | None:
+    discord_id = discord_reference_message_id(message)
+    if discord_id is None:
+        return None
+
+    groupme_id = groupme_message_for_discord_reply(conversation_id, discord_id)
+    if groupme_id is None:
+        return None
+    return {
+        "type": "reply",
+        "reply_id": groupme_id,
+        "base_reply_id": groupme_id,
+    }
 
 
 def groupme_image_urls(message: dict) -> list[str]:
@@ -1569,13 +1653,13 @@ def message_id_at_least(message_id: str, boundary: str) -> bool:
 
 
 def format_discord_groupme_body(
-    message: discord.Message, text: str
+    message: discord.Message, text: str, *, include_reply_quote: bool = True
 ) -> tuple[str, list[discord.Attachment]]:
     """Render a Discord message body and return its image attachments."""
     images = [attachment for attachment in message.attachments if is_image_attachment(attachment)]
     links = [attachment.url for attachment in message.attachments if not is_image_attachment(attachment)]
     header = f"{message.author.display_name or message.author.name}:"
-    quote = quoted_reply(message)
+    quote = quoted_reply(message) if include_reply_quote else ""
     if quote:
         body = f"{quote}{header} {text}".rstrip()
     else:
@@ -1647,7 +1731,21 @@ async def relay_discord_message(
     client=None,
 ) -> None:
     text = render_discord_content(message, await resolve_mention_names(message))
-    body, images = format_discord_groupme_body(message, text)
+    conversation_id = outbound_conversation_id(bridge)
+    discord_reply_id = discord_reference_message_id(message)
+    reply_attachment = groupme_reply_attachment_for_discord_message(
+        message, conversation_id
+    )
+    if discord_reply_id is not None and reply_attachment is None:
+        log.warning(
+            "Discord reply %s has no mapped GroupMe parent %s in %s; using quoted text",
+            message.id,
+            discord_reply_id,
+            conversation_id,
+        )
+    body, images = format_discord_groupme_body(
+        message, text, include_reply_quote=reply_attachment is None
+    )
     header = f"{message.author.display_name or message.author.name}:"
 
     # GroupMe only accepts i.groupme.com image URLs ("invalid origin" otherwise), so
@@ -1668,18 +1766,29 @@ async def relay_discord_message(
         body = truncate(body)
 
     if bridge["send_mode"] == "user":
-        await send_as_user(session, bridge, body, hosted, discord_id=message.id)
+        await send_as_user(
+            session,
+            bridge,
+            body,
+            hosted,
+            discord_id=message.id,
+            reply_attachment=reply_attachment,
+        )
     else:
         bot_id = bridge["bot_id"]
         try:
-            await groupme_post_bot(session, bot_id, body)
+            await groupme_post_bot(
+                session, bot_id, body, attachments=[reply_attachment] if reply_attachment else None
+            )
         except GroupMeError as error:
             # GroupMe answers 404 when the bot id no longer exists (deleted, recreated,
             # or copied from another account). Repair the, client bridge and post once more.
             if error.status != 404:
                 raise
             bot_id = await recover_bot_id(session, bridge)
-            await groupme_post_bot(session, bot_id, body)
+            await groupme_post_bot(
+                session, bot_id, body, attachments=[reply_attachment] if reply_attachment else None
+            )
         posts: list[tuple[str, str]] = [(body, "")]
         for image_url in hosted:
             await groupme_post_bot(session, bot_id, header, picture_url=image_url)
@@ -1817,6 +1926,7 @@ async def send_as_user(
     image_urls: list[str],
     *,
     discord_id: int | None = None,
+    reply_attachment: dict | None = None,
 ) -> None:
     """Post with the access token instead of a bot.
 
@@ -1827,6 +1937,8 @@ async def send_as_user(
             "GROUPME_ACCESS_TOKEN is required to post as a GroupMe user"
         )
     attachments = [{"type": "image", "url": url} for url in image_urls]
+    if reply_attachment:
+        attachments.append(reply_attachment)
 
     conversation_id = outbound_conversation_id(bridge)
     created = await groupme_post_message(session, conversation_id, body, attachments)
@@ -3450,6 +3562,94 @@ class Bot(discord.Client):
         payload.setdefault("wait", True)
         return await webhook.send(**payload)
 
+    async def groupme_reply_view(
+        self, bridge: sqlite3.Row, message: dict
+    ) -> discord.ui.View | None:
+        attachment = next(
+            (
+                item
+                for item in message.get("attachments") or []
+                if (item.get("type") or "").lower() == "reply"
+            ),
+            None,
+        )
+        if attachment is None:
+            return None
+        if not attachment.get("reply_id"):
+            log.warning(
+                "GroupMe reply %s has no reply_id; using quoted text",
+                message.get("id"),
+            )
+            return None
+
+        name = str(attachment.get("name") or "").strip()
+        privacy = groupme_user_mode(name)
+        if privacy == PRIVACY_OPTOUT:
+            log.warning(
+                "Not linking GroupMe reply %s to an opted-out parent; using redacted quote",
+                message.get("id"),
+            )
+            return None
+        if privacy == PRIVACY_ANONYMIZE:
+            name = ANONYMOUS_GROUPME_NAME
+        elif not name:
+            name = "GroupMe user"
+
+        target = discord_message_for_groupme_reply(
+            str(bridge["conversation_id"]),
+            str(attachment["reply_id"]),
+            int(bridge["channel_id"]),
+        )
+        if target is None:
+            log.warning(
+                "GroupMe reply %s has no mapped Discord parent %s in %s; using quoted text",
+                message.get("id"),
+                attachment["reply_id"],
+                bridge["conversation_id"],
+            )
+            return None
+        discord_message_id, channel_id = target
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except discord.HTTPException:
+                log.warning(
+                    "Could not resolve Discord channel %s for GroupMe reply %s",
+                    channel_id,
+                    message.get("id"),
+                    exc_info=True,
+                )
+                return None
+        guild_id = getattr(getattr(channel, "guild", None), "id", None)
+        if guild_id is None:
+            log.warning(
+                "Could not build a Discord link for GroupMe reply %s: channel %s has no guild",
+                message.get("id"),
+                channel_id,
+            )
+            return None
+
+        preview = str(attachment.get("text") or "").strip()
+        preview = render_groupme_mentions(preview, attachment.get("attachments"))
+        preview = " ".join(strip_emoji(CUSTOM_EMOJI_RE.sub("", preview)).split())
+        view = discord.ui.View(timeout=None)
+        view.add_item(
+            discord.ui.Button(
+                label=truncate(f"Reply To: {name}", 80),
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+            )
+        )
+        view.add_item(
+            discord.ui.Button(
+                label=truncate(preview, 80) or "Open replied-to message",
+                style=discord.ButtonStyle.link,
+                url=f"https://discord.com/channels/{guild_id}/{channel_id}/{discord_message_id}",
+            )
+        )
+        return view
+
     # -- GroupMe ingestion -------------------------------------------------- #
 
     async def handle_groupme_callback(self, request: web.Request) -> web.Response:
@@ -3543,7 +3743,8 @@ class Bot(discord.Client):
         message = await resolve_groupme_reply(
             self.groupme_session, group_id, message
         )
-        text = groupme_message_text(message)
+        reply_view = await self.groupme_reply_view(bridge, message)
+        text = groupme_message_text(message, include_reply_quote=reply_view is None)
         image_urls = groupme_image_urls(message)
         video_urls = groupme_video_urls(message)
         video_limit = (
@@ -3599,14 +3800,17 @@ class Bot(discord.Client):
                         message_id,
                     )
                     return
+                payload = {
+                    "content": text or None,
+                    "username": username,
+                    "avatar_url": avatar_url,
+                    "files": files,
+                    "allowed_mentions": discord.AllowedMentions.none(),
+                }
+                if reply_view is not None:
+                    payload["view"] = reply_view
                 sent = await self.send_via_webhook(
-                    bridge,
-                    refresh=attempt == 2,
-                    content=text or None,
-                    username=username,
-                    avatar_url=avatar_url,
-                    files=files,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    bridge, refresh=attempt == 2, **payload
                 )
                 break
             except (discord.NotFound, discord.Forbidden):
@@ -3725,7 +3929,12 @@ class Bot(discord.Client):
             return
 
         text = render_discord_content(message, await resolve_mention_names(message))
-        body, _ = format_discord_groupme_body(message, text)
+        has_groupme_reply = groupme_reply_attachment_for_discord_message(
+            message, conversation_id
+        ) is not None
+        body, _ = format_discord_groupme_body(
+            message, text, include_reply_quote=not has_groupme_reply
+        )
         try:
             await groupme_edit_message(
                 self.groupme_session, conversation_id, str(rows[0]["groupme_id"]), truncate(body)
@@ -3912,7 +4121,10 @@ class Bot(discord.Client):
         resolved = await resolve_groupme_reply(
             self.groupme_session, conversation_id, message
         )
-        content = groupme_message_text(resolved) or None
+        reply_view = await self.groupme_reply_view(bridge, resolved)
+        content = groupme_message_text(
+            resolved, include_reply_quote=reply_view is None
+        ) or None
         if not await self.edit_discord_copy(bridge, str(link["target_id"]), content):
             return False
 

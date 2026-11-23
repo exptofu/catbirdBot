@@ -184,6 +184,20 @@ reply = {
 }
 rendered_reply = bot.groupme_message_text(reply)
 assert rendered_reply == "> Ann: meet at 7?\nsounds good", rendered_reply
+multiline_reply = {
+    "text": "pacific loon",
+    "attachments": [
+        {
+            "type": "reply",
+            "name": "GA Birding Discord",
+            "text": '"Stone Mountain PALO continues!\nKylie Isaack (Fulton): What is a PALO?',
+        }
+    ],
+}
+assert bot.groupme_message_text(multiline_reply) == (
+    '> GA Birding Discord: "Stone Mountain PALO continues!\n'
+    "> Kylie Isaack (Fulton): What is a PALO?\npacific loon"
+)
 assert bot.groupme_message_text({"attachments": [{"type": "reply", "name": "Ann"}]}) == "> Replying to Ann"
 assert bot.groupme_message_text({"attachments": [{"type": "reply"}]}) == "> (GroupMe reply)"
 assert "[reply]" not in bot.groupme_message_text({"text": "x", "attachments": [{"type": "reply"}]})

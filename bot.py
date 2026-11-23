@@ -1150,12 +1150,13 @@ def groupme_reply_quote(attachment: dict) -> str:
         name = ANONYMOUS_GROUPME_NAME
     quoted = render_groupme_mentions(quoted, attachment.get("attachments"))
     quoted = truncate(strip_emoji(CUSTOM_EMOJI_RE.sub("", quoted)), 120)
-    if name and quoted:
-        return f"> {name}: {quoted}"
+    if quoted:
+        lines = quoted.splitlines()
+        if name:
+            lines[0] = f"{name}: {lines[0]}"
+        return "\n".join(f"> {line}" for line in lines)
     if name:
         return f"> Replying to {name}"
-    if quoted:
-        return f"> {quoted}"
     return "> (GroupMe reply)"
 
 

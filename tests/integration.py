@@ -16,6 +16,8 @@ CREATED_BOTS = []
 UPLOADS = []
 CALLS = []
 DELETED_MESSAGES = []
+MESSAGE_READ_LIMITS = []
+EDITED_MESSAGES = []
 LATEST_MESSAGES = []
 VIDEO_BYTES = b"test video bytes"
 
@@ -144,6 +146,7 @@ async def group_messages(request):
     gid = request.match_info["group_id"]
     since = request.query.get("since_id")
     CALLS.append(f"{gid}:{since}")
+    MESSAGE_READ_LIMITS.append(int(request.query.get("limit", "0")))
     if since == "5":
         return web.Response(status=304)
     if not since:
@@ -547,6 +550,9 @@ async def main():
             async def delete_message(self, message_id, **kwargs):
                 webhook_calls.append((message_id, kwargs))
 
+            async def edit_message(self, message_id, **kwargs):
+                EDITED_MESSAGES.append((message_id, kwargs))
+
         async def fake_get_webhook(bridge, *, refresh=False):
             return FakeWebhook()
 
@@ -558,6 +564,50 @@ async def main():
         assert await bot.client.delete_discord_copy(topic_bridge, "4243")
         assert webhook_calls[-1][0] == 4243, webhook_calls
         assert webhook_calls[-1][1]["thread"].id == 777, webhook_calls
+
+        # Recent GroupMe text edits update the linked Discord webhook message in place.
+        original_groupme_message = {
+            "id": "9150",
+            "group_id": "G1",
+            "sender_type": "user",
+            "user_id": "u1",
+            "name": "Ann",
+            "text": "before edit",
+            "created_at": now_epoch,
+        }
+        original_relay = bot.client.send_via_webhook
+
+        async def fake_relay(bridge, **payload):
+            class Sent:
+                id = 4240
+
+            return Sent()
+
+        bot.client.send_via_webhook = fake_relay
+        try:
+            await bot.client.process_groupme_message(
+                original_groupme_message, source="test"
+            )
+        finally:
+            bot.client.send_via_webhook = original_relay
+        assert bot.groupme_message_version("G1", "9150") == bot.groupme_message_content_hash(
+            original_groupme_message
+        )
+        LATEST_MESSAGES[:] = [dict(original_groupme_message, text="after edit")]
+        EDITED_MESSAGES.clear()
+        MESSAGE_READ_LIMITS.clear()
+        await bot.client.reconcile_groupme_deletions(
+            session, bot.bridge_for_conversation("G1")
+        )
+        assert EDITED_MESSAGES[-1][0] == 4240, EDITED_MESSAGES
+        assert EDITED_MESSAGES[-1][1]["content"] == "after edit", EDITED_MESSAGES
+        assert MESSAGE_READ_LIMITS[-1] == bot.GROUPME_HISTORY_LIMIT, MESSAGE_READ_LIMITS
+        await bot.client.reconcile_groupme_deletions(
+            session, bot.bridge_for_conversation("G1")
+        )
+        assert len(EDITED_MESSAGES) == 1, EDITED_MESSAGES
+        bot.remove_link(bot.LINK_GROUPME, "G1", "9150")
+        bot.remove_groupme_message_version("G1", "9150")
 
         # a GroupMe message missing from the newest page loses its Discord copy
         removed_copies = []

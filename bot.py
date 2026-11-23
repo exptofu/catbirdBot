@@ -21,9 +21,10 @@ Deletions are mirrored in both directions. GroupMe's public docs list only index
 and create, but its own clients delete through the `conversations` endpoint, which
 is what `groupme_delete_message` uses. GroupMe never reports a deletion, so the
 poller compares the newest page of each bridged conversation with the stored
-links. Edits are still not mirrored.
+links. Recent GroupMe text edits are detected by the same bounded history scan.
 """
 import asyncio
+import hashlib
 import inspect
 import io
 import json
@@ -66,7 +67,7 @@ GROUPME_POLL_BACKFILL_SECONDS = max(
 GROUPME_POLL_BACKFILL_EVERY = max(
     1, round(GROUPME_POLL_BACKFILL_SECONDS / GROUPME_POLL_SECONDS)
 )
-# Widest window a poll fetches, and the window used to detect deleted messages.
+# Widest window a poll fetches, and the bounded window used to detect edits/deletions.
 GROUPME_HISTORY_LIMIT = max(
     GROUPME_POLL_RECENT_LIMIT,
     min(100, int(os.environ.get("GROUPME_HISTORY_LIMIT", "25"))),
@@ -75,8 +76,8 @@ GROUPME_REQUEST_DELAY_SECONDS = float(os.environ.get("GROUPME_REQUEST_DELAY_SECO
 # Mirror deletions: a deleted Discord message removes its GroupMe copy, and a
 # GroupMe message that disappears takes its mirrored Discord copy with it.
 SYNC_DELETIONS = os.environ.get("SYNC_DELETIONS", "true").strip().lower() not in {"0", "false", "no", "off"}
-# GroupMe keeps deleted messages as tombstones and emits a `message.deleted`
-# system event; this interval is the fallback check for links whose event was missed.
+# GroupMe edits are found by checking this recent history window; the same check
+# catches deleted-message tombstones and missed `message.deleted` events.
 GROUPME_DELETE_CHECK_SECONDS = max(60, int(os.environ.get("GROUPME_DELETE_CHECK_SECONDS", "60")))
 # Loopback by default: the ngrok tunnel forwards to localhost, so nothing has to be
 # reachable from the internet (the callback path has no authentication of its own).
@@ -230,6 +231,13 @@ CREATE_SQL = f"""
         PRIMARY KEY (direction, group_id, source_id)
     );
     CREATE INDEX IF NOT EXISTS message_links_source ON message_links (direction, source_id);
+    -- Rendered content of recently relayed GroupMe messages, for edit detection.
+    CREATE TABLE IF NOT EXISTS groupme_message_versions (
+        group_id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        PRIMARY KEY (group_id, source_id)
+    );
     -- Discord message -> GroupMe message(s) posted by the bridge, for deletion sync.
     -- One Discord message can become several GroupMe messages: the text post plus
     -- one picture post per image, because /bots/post returns no message id.
@@ -258,6 +266,7 @@ DROP_SQL = """
     DROP TABLE IF EXISTS bridges_v1;
     DROP TABLE IF EXISTS group_state;
     DROP TABLE IF EXISTS message_links;
+    DROP TABLE IF EXISTS groupme_message_versions;
     DROP TABLE IF EXISTS outbound_messages;
 """
 
@@ -474,6 +483,9 @@ def delete_bridge(conversation_id: str) -> None:
     db.execute("DELETE FROM group_state WHERE group_id=?", (str(conversation_id),))
     db.execute("DELETE FROM outbound_messages WHERE group_id=?", (str(conversation_id),))
     db.execute("DELETE FROM message_links WHERE group_id=?", (str(conversation_id),))
+    db.execute(
+        "DELETE FROM groupme_message_versions WHERE group_id=?", (str(conversation_id),)
+    )
     db.commit()
 
 
@@ -528,6 +540,40 @@ def remove_link(direction: str, group_id: str, source_id: str) -> None:
     db.execute(
         "DELETE FROM message_links WHERE direction=? AND group_id=? AND source_id=?",
         (direction, str(group_id), str(source_id)),
+    )
+    db.commit()
+
+
+def groupme_message_content_hash(message: dict) -> str:
+    """Hash the rendered text so changed GroupMe content can update its Discord copy."""
+    content = groupme_message_text(message)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def groupme_message_version(group_id: str, source_id: str) -> str | None:
+    row = db.execute(
+        "SELECT content_hash FROM groupme_message_versions WHERE group_id=? AND source_id=?",
+        (str(group_id), str(source_id)),
+    ).fetchone()
+    return str(row["content_hash"]) if row else None
+
+
+def set_groupme_message_version(group_id: str, source_id: str, content_hash: str) -> None:
+    db.execute(
+        """
+        INSERT INTO groupme_message_versions (group_id, source_id, content_hash)
+        VALUES (?, ?, ?)
+        ON CONFLICT(group_id, source_id) DO UPDATE SET content_hash=excluded.content_hash
+        """,
+        (str(group_id), str(source_id), content_hash),
+    )
+    db.commit()
+
+
+def remove_groupme_message_version(group_id: str, source_id: str) -> None:
+    db.execute(
+        "DELETE FROM groupme_message_versions WHERE group_id=? AND source_id=?",
+        (str(group_id), str(source_id)),
     )
     db.commit()
 
@@ -1111,7 +1157,7 @@ async def resolve_groupme_reply(
 
     try:
         recent_messages = await groupme_list_messages(
-            session, conversation_id, limit=100
+        session, conversation_id, limit=GROUPME_HISTORY_LIMIT
         )
     except GroupMeError as error:
         log.warning(
@@ -3252,7 +3298,7 @@ class Bot(discord.Client):
         # main chats only when GROUPME_MODE=poll or the bridge has no bot.
         if not poll_groupme.is_running():
             poll_groupme.start()
-        if SYNC_DELETIONS and not check_groupme_deletions.is_running():
+        if GROUPME_ACCESS_TOKEN and not check_groupme_deletions.is_running():
             check_groupme_deletions.start()
 
         invite = discord.utils.oauth_url(self.user.id, permissions=REQUIRED_PERMS, scopes=("bot",))
@@ -3443,11 +3489,12 @@ class Bot(discord.Client):
             return
         if link_exists(LINK_GROUPME, group_id, message_id):
             log.info(
-                "Skipping already-relayed GroupMe message %s (group %s, via %s)",
+                "Checking already-relayed GroupMe message %s for edits (group %s, via %s)",
                 message_id,
                 group_id,
                 source,
             )
+            await self.update_groupme_copy(bridge, message)
             return
 
         privacy = groupme_user_mode(message.get("name") or "")
@@ -3461,6 +3508,7 @@ class Bot(discord.Client):
             )
             return
 
+        content_hash = groupme_message_content_hash(message)
         message = await resolve_groupme_reply(
             self.groupme_session, group_id, message
         )
@@ -3552,6 +3600,8 @@ class Bot(discord.Client):
             str(sent.id) if sent else None,
             from_epoch(message.get("created_at")),
         )
+        if sent:
+            set_groupme_message_version(group_id, message_id, content_hash)
         set_last_seen(group_id, message_id)
         log.info(
             "Relayed GroupMe message %s from group %s to channel %s "
@@ -3618,6 +3668,7 @@ class Bot(discord.Client):
                 continue
             remove_outbound(conversation_id, discord_id, groupme_id)
             remove_link(LINK_GROUPME, conversation_id, groupme_id)
+            remove_groupme_message_version(conversation_id, groupme_id)
             log.info(
                 "Deleted GroupMe message %s in %s because Discord message %s was deleted",
                 groupme_id,
@@ -3641,6 +3692,7 @@ class Bot(discord.Client):
         if not await self.delete_discord_copy(bridge, str(link["target_id"])):
             return False
         remove_link(LINK_GROUPME, conversation_id, source_id)
+        remove_groupme_message_version(conversation_id, source_id)
         log.info(
             "Deleted the Discord copy of GroupMe message %s in %s: it was deleted",
             source_id,
@@ -3685,42 +3737,124 @@ class Bot(discord.Client):
             )
             return False
 
+    async def edit_discord_copy(
+        self, bridge: sqlite3.Row, discord_id: str, content: str | None
+    ) -> bool:
+        """Edit the text of the webhook message mirroring a GroupMe message."""
+        thread = (
+            discord.Object(id=int(bridge["channel_id"]))
+            if bridge["target_kind"] == "thread"
+            else None
+        )
+        try:
+            webhook = await self.get_webhook(bridge)
+            payload = {
+                "content": content,
+                "allowed_mentions": discord.AllowedMentions.none(),
+            }
+            if thread is not None:
+                payload["thread"] = thread
+            await webhook.edit_message(int(discord_id), **payload)
+            return True
+        except (discord.HTTPException, RuntimeError):
+            log.exception(
+                "Could not edit Discord message %s mirroring GroupMe conversation %s",
+                discord_id,
+                bridge["conversation_id"],
+            )
+            return False
+
+    async def update_groupme_copy(self, bridge: sqlite3.Row, message: dict) -> bool:
+        """Update a linked Discord message when GroupMe's rendered text changes."""
+        conversation_id = str(bridge["conversation_id"])
+        source_id = str(message.get("id") or "")
+        if not source_id:
+            return False
+        if groupme_user_mode(message.get("name") or "") == PRIVACY_OPTOUT:
+            return False
+        link = db.execute(
+            """
+            SELECT target_id FROM message_links
+             WHERE direction=? AND group_id=? AND source_id=? AND target_id IS NOT NULL
+            """,
+            (LINK_GROUPME, conversation_id, source_id),
+        ).fetchone()
+        if link is None:
+            return False
+
+        content_hash = groupme_message_content_hash(message)
+        previous_hash = groupme_message_version(conversation_id, source_id)
+        if previous_hash is None:
+            # Existing bridges may have links created before edit tracking was added.
+            set_groupme_message_version(conversation_id, source_id, content_hash)
+            return False
+        if content_hash == previous_hash:
+            return False
+
+        resolved = await resolve_groupme_reply(
+            self.groupme_session, conversation_id, message
+        )
+        content = groupme_message_text(resolved) or None
+        if not await self.edit_discord_copy(bridge, str(link["target_id"]), content):
+            return False
+
+        set_groupme_message_version(conversation_id, source_id, content_hash)
+        log.info(
+            "Edited Discord message %s from updated GroupMe message %s in %s",
+            link["target_id"],
+            source_id,
+            conversation_id,
+        )
+        return True
+
     async def reconcile_groupme_deletions(
         self, session: aiohttp.ClientSession, bridge: sqlite3.Row
     ) -> None:
-        """Delete Discord copies of GroupMe messages that no longer exist.
+        """Reconcile recent GroupMe edits and deletions against Discord copies.
 
-        GroupMe emits no delete callback, so the newest page of the conversation is
-        compared with the links this bridge recorded. Only linked messages inside
-        that page can be checked; older ones are left alone rather than paged for.
+        One bounded history read checks both changes and missing messages. Edits and
+        deletions older than this page are left alone rather than paging all history.
         """
         conversation_id = str(bridge["conversation_id"])
-        links = db.execute(
-            """
-            SELECT source_id, target_id FROM message_links
-             WHERE direction=? AND group_id=? AND target_id IS NOT NULL
-            """,
-            (LINK_GROUPME, conversation_id),
-        ).fetchall()
-        if not links:
-            return
-
         messages = await groupme_list_messages(
             session, conversation_id, limit=GROUPME_HISTORY_LIMIT
         )
         if not messages:
             return
-        present = {
-            str(message.get("id"))
-            for message in messages
-            if message.get("id") and not groupme_deleted_message_id(message)
-        }
+
+        present: set[str] = set()
+        deleted_ids: set[str] = set()
+        for message in messages:
+            deleted_id = groupme_deleted_message_id(message)
+            if deleted_id:
+                deleted_ids.add(deleted_id)
+                if SYNC_DELETIONS:
+                    await self.delete_groupme_copy(bridge, deleted_id)
+                continue
+            source_id = str(message.get("id") or "")
+            if not source_id:
+                continue
+            present.add(source_id)
+            if link_exists(LINK_GROUPME, conversation_id, source_id):
+                await self.update_groupme_copy(bridge, message)
+
+        if not SYNC_DELETIONS:
+            return
+        links = db.execute(
+            """
+            SELECT source_id FROM message_links
+             WHERE direction=? AND group_id=? AND target_id IS NOT NULL
+            """,
+            (LINK_GROUPME, conversation_id),
+        ).fetchall()
         complete = len(messages) < GROUPME_HISTORY_LIMIT
         oldest = oldest_numeric_id(messages)
 
         for link in links:
             source_id = str(link["source_id"])
             if source_id in present:
+                continue
+            if source_id in deleted_ids:
                 continue
             # A page shorter than the limit covers all history; otherwise only ids
             # at or above its oldest entry can be proven absent.
@@ -3758,8 +3892,8 @@ def poll_targets() -> list[tuple[str, sqlite3.Row]]:
 
 @tasks.loop(seconds=GROUPME_DELETE_CHECK_SECONDS)
 async def check_groupme_deletions() -> None:
-    """Remove Discord copies of GroupMe messages that were deleted in GroupMe."""
-    if not SYNC_DELETIONS or not GROUPME_ACCESS_TOKEN:
+    """Check recent GroupMe message text and deletion changes."""
+    if not GROUPME_ACCESS_TOKEN:
         return
     async with aiohttp.ClientSession() as session:
         for bridge in list_bridges():
@@ -3767,9 +3901,9 @@ async def check_groupme_deletions() -> None:
             try:
                 await client.reconcile_groupme_deletions(session, bridge)
             except GroupMeError:
-                log.exception("Could not check %s for deleted messages", conversation_id)
+                log.exception("Could not check %s for GroupMe message changes", conversation_id)
             except aiohttp.ClientError:
-                log.exception("GroupMe deletion check failed for %s", conversation_id)
+                log.exception("GroupMe message-change check failed for %s", conversation_id)
             await asyncio.sleep(GROUPME_REQUEST_DELAY_SECONDS)
 
 

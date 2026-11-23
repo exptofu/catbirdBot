@@ -813,7 +813,28 @@ async def main():
 
         class UploadChannel:
             guild = UploadGuild()
+            messages = {}
 
+            async def fetch_message(self, message_id):
+                return self.messages[message_id]
+
+        UploadChannel.messages = {
+            4247: SimpleNamespace(
+                author=SimpleNamespace(display_name="Bea", name="Bea"),
+                clean_content="the quoted original",
+                webhook_id=123,
+            ),
+            4248: SimpleNamespace(
+                author=SimpleNamespace(display_name="Bea", name="Bea"),
+                clean_content="x" * 100,
+                webhook_id=123,
+            ),
+            4249: SimpleNamespace(
+                author=SimpleNamespace(display_name="Nick Name", name="Nick Name"),
+                clean_content="content",
+                webhook_id=None,
+            ),
+        }
         bot.client.get_channel = lambda _channel_id: UploadChannel()
         bot.set_groupme_user_mode("Quiet Person", bot.PRIVACY_OPTOUT)
         try:
@@ -924,7 +945,7 @@ async def main():
             assert sent_payloads[-1]["content"] == "my reply"
             reply_view = sent_payloads[-1]["view"]
             assert len(reply_view.children) == 2, reply_view.children
-            assert reply_view.children[0].label == "Reply To: Bea"
+            assert reply_view.children[0].label == "Reply to: Bea"
             assert reply_view.children[0].disabled
             assert reply_view.children[1].label == "the quoted original"
             assert reply_view.children[1].url == (
@@ -945,8 +966,8 @@ async def main():
                         {
                             "type": "reply",
                             "reply_id": "9597",
-                            "name": "Discord author",
-                            "text": "discord-origin parent",
+                            "name": "GA Birding Discord",
+                            "text": "Nick Name: content",
                         }
                     ],
                     "created_at": now_epoch,
@@ -957,6 +978,8 @@ async def main():
             assert sent_payloads[-1]["view"].children[1].url == (
                 "https://discord.com/channels/123456/555/4249"
             )
+            assert sent_payloads[-1]["view"].children[0].label == "Reply to: Nick Name"
+            assert sent_payloads[-1]["view"].children[1].label == "content"
 
             LATEST_MESSAGES[:] = [
                 {

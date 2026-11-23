@@ -3582,19 +3582,6 @@ class Bot(discord.Client):
             )
             return None
 
-        name = str(attachment.get("name") or "").strip()
-        privacy = groupme_user_mode(name)
-        if privacy == PRIVACY_OPTOUT:
-            log.warning(
-                "Not linking GroupMe reply %s to an opted-out parent; using redacted quote",
-                message.get("id"),
-            )
-            return None
-        if privacy == PRIVACY_ANONYMIZE:
-            name = ANONYMOUS_GROUPME_NAME
-        elif not name:
-            name = "GroupMe user"
-
         target = discord_message_for_groupme_reply(
             str(bridge["conversation_id"]),
             str(attachment["reply_id"]),
@@ -3621,6 +3608,29 @@ class Bot(discord.Client):
                     exc_info=True,
                 )
                 return None
+        try:
+            original = await channel.fetch_message(int(discord_message_id))
+        except discord.HTTPException:
+            log.warning(
+                "Could not fetch Discord parent %s for GroupMe reply %s; using quoted text",
+                discord_message_id,
+                message.get("id"),
+                exc_info=True,
+            )
+            return None
+
+        name = original.author.display_name or original.author.name
+        if original.webhook_id is not None:
+            privacy = groupme_user_mode(name)
+            if privacy == PRIVACY_OPTOUT:
+                log.warning(
+                    "Not linking GroupMe reply %s to an opted-out parent; using redacted quote",
+                    message.get("id"),
+                )
+                return None
+            if privacy == PRIVACY_ANONYMIZE:
+                name = ANONYMOUS_GROUPME_NAME
+
         guild_id = getattr(getattr(channel, "guild", None), "id", None)
         if guild_id is None:
             log.warning(
@@ -3630,13 +3640,13 @@ class Bot(discord.Client):
             )
             return None
 
-        preview = str(attachment.get("text") or "").strip()
+        preview = (original.clean_content or attachment.get("text") or "").strip()
         preview = render_groupme_mentions(preview, attachment.get("attachments"))
         preview = " ".join(strip_emoji(CUSTOM_EMOJI_RE.sub("", preview)).split())
         view = discord.ui.View(timeout=None)
         view.add_item(
             discord.ui.Button(
-                label=truncate(f"Reply To: {name}", 80),
+                label=truncate(f"Reply to: {name}", 80),
                 style=discord.ButtonStyle.secondary,
                 disabled=True,
             )

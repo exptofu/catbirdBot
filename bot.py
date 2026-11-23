@@ -17,11 +17,11 @@ Message flow:
 Every `/bridge` command except `add` and `topics` acts on the channel or post it
 was run in, so no command takes a Discord channel argument.
 
-Deletions are mirrored in both directions. GroupMe's public docs list only index
-and create, but its own clients delete through the `conversations` endpoint, which
-is what `groupme_delete_message` uses. GroupMe never reports a deletion, so the
-poller compares the newest page of each bridged conversation with the stored
-links. Recent GroupMe text edits are detected by the same bounded history scan.
+GroupMe edits and deletions are mirrored where the API allows them. GroupMe's v4
+message endpoint supports edits, while its own clients delete through the
+`conversations` endpoint. GroupMe never reports a deletion, so the poller compares
+the newest page of each bridged conversation with the stored links. Recent GroupMe
+text edits are detected by the same bounded history scan.
 """
 import asyncio
 import hashlib
@@ -67,6 +67,7 @@ GROUPME_POLL_BACKFILL_SECONDS = max(
 GROUPME_POLL_BACKFILL_EVERY = max(
     1, round(GROUPME_POLL_BACKFILL_SECONDS / GROUPME_POLL_SECONDS)
 )
+GROUPME_EDIT_WINDOW_SECONDS = 15 * 60
 # Widest window a poll fetches, and the bounded window used to detect edits/deletions.
 GROUPME_HISTORY_LIMIT = max(
     GROUPME_POLL_RECENT_LIMIT,
@@ -704,9 +705,14 @@ async def groupme_request(
     params: dict | None = None,
     json_body: dict | None = None,
     form: dict | None = None,
+    api_version: str | None = None,
 ):
     """Call the GroupMe API, retrying rate limits and server errors."""
-    url = f"{GROUPME_API_BASE}{path}"
+    if api_version:
+        api_root = re.sub(r"/v\d+$", "", GROUPME_API_BASE)
+        url = f"{api_root}/{api_version.strip('/')}{path}"
+    else:
+        url = f"{GROUPME_API_BASE}{path}"
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -807,9 +813,8 @@ async def groupme_delete_message(
 ) -> None:
     """Delete a message the token owner is allowed to remove.
 
-    GroupMe documents only index and create, but its own clients delete through
-    `DELETE /conversations/:conversation_id/messages/:message_id` (204). A 404
-    means the message is already gone, which is the desired end state.
+    GroupMe clients delete through `DELETE /conversations/:conversation_id/messages/:message_id`
+    (204). A 404 means the message is already gone, which is the desired end state.
     """
     try:
         await groupme_request(
@@ -820,6 +825,22 @@ async def groupme_delete_message(
     except GroupMeError as error:
         if error.status != 404:
             raise
+
+
+async def groupme_edit_message(
+    session: aiohttp.ClientSession,
+    conversation_id: str,
+    message_id: str,
+    text: str,
+) -> None:
+    """Edit a token-owned message through GroupMe's v4 API."""
+    await groupme_request(
+        session,
+        "PUT",
+        f"/groups/{conversation_id}/messages/{message_id}",
+        json_body={"text": text},
+        api_version="v4",
+    )
 
 
 async def groupme_list_bots(session: aiohttp.ClientSession) -> list[dict]:
@@ -1546,6 +1567,26 @@ def message_id_at_least(message_id: str, boundary: str) -> bool:
         return False
 
 
+def format_discord_groupme_body(
+    message: discord.Message, text: str
+) -> tuple[str, list[discord.Attachment]]:
+    """Render a Discord message body and return its image attachments."""
+    images = [attachment for attachment in message.attachments if is_image_attachment(attachment)]
+    links = [attachment.url for attachment in message.attachments if not is_image_attachment(attachment)]
+    header = f"{message.author.display_name or message.author.name}:"
+    quote = quoted_reply(message)
+    if quote:
+        body = f"{quote}{header} {text}".rstrip()
+    else:
+        body = f"{header} {text}".rstrip()
+    if links:
+        body = f"{body}\n" + "\n".join(links)
+    if len(images) > MAX_GROUPME_IMAGES:
+        overflow = [attachment.url for attachment in images[MAX_GROUPME_IMAGES:]]
+        body = f"{body}\n" + "\n".join(overflow)
+    return body, images[:MAX_GROUPME_IMAGES]
+
+
 async def record_bot_posts(
     session: aiohttp.ClientSession,
     conversation_id: str,
@@ -1604,25 +1645,9 @@ async def relay_discord_message(
     bridge: sqlite3.Row,
     client=None,
 ) -> None:
-    name = message.author.display_name or message.author.name
     text = render_discord_content(message, await resolve_mention_names(message))
-    images = [a for a in message.attachments if is_image_attachment(a)]
-    links = [a.url for a in message.attachments if not is_image_attachment(a)]
-
-    # The nickname always leads the message so GroupMe members see who typed it,
-    # including on picture-only posts (the bot posts those separately).
-    header = f"{name}:"
-    quote = quoted_reply(message)
-    if quote:
-        body = f"{quote}{header} {text}".rstrip()
-    else:
-        body = f"{header} {text}".rstrip()
-    if links:
-        body = f"{body}\n" + "\n".join(links)
-    if len(images) > MAX_GROUPME_IMAGES:
-        overflow = [a.url for a in images[MAX_GROUPME_IMAGES:]]
-        body = f"{body}\n" + "\n".join(overflow)
-    images = images[:MAX_GROUPME_IMAGES]
+    body, images = format_discord_groupme_body(message, text)
+    header = f"{message.author.display_name or message.author.name}:"
 
     # GroupMe only accepts i.groupme.com image URLs ("invalid origin" otherwise), so
     # every image is compressed and re-hosted before the relay; failures are reported.
@@ -1817,7 +1842,12 @@ async def send_as_user(
             utcnow(),
         )
         if discord_id is not None:
-            add_outbound(conversation_id, discord_id, message_id, utcnow())
+            add_outbound(
+                conversation_id,
+                discord_id,
+                message_id,
+                from_epoch(created.get("created_at")),
+            )
         cutoff = time.monotonic() - 900
         for key in [key for key, stamp in RECENT_OUTBOUND.items() if stamp < cutoff]:
             RECENT_OUTBOUND.pop(key, None)
@@ -3626,6 +3656,93 @@ class Bot(discord.Client):
             await relay_discord_message(self.groupme_session, message, bridge, self)
         except (GroupMeError, discord.HTTPException):
             log.exception("Could not relay Discord message %s to GroupMe", message.id)
+
+    async def on_raw_message_edit(self, payload) -> None:
+        if payload.guild_id is None or "content" not in payload.data:
+            return
+        bridge = bridge_for_destination(payload.channel_id)
+        if bridge is None:
+            return
+        cached = payload.cached_message
+        if cached is not None and cached.content == payload.data.get("content"):
+            return
+        try:
+            channel = self.get_channel(payload.channel_id) or await self.fetch_channel(
+                payload.channel_id
+            )
+            message = await channel.fetch_message(payload.message_id)
+        except discord.NotFound:
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Could not fetch edited Discord message %s", payload.message_id)
+            return
+        await self.sync_discord_edit(message)
+
+    async def sync_discord_edit(self, message: discord.Message) -> None:
+        """Mirror an eligible Discord text edit to its token-authored GroupMe post."""
+        if message.guild is None or message.author.bot or message.webhook_id is not None:
+            return
+        bridge = bridge_for_destination(bridged_channel_id(message))
+        if bridge is None:
+            return
+        conversation_id = str(bridge["conversation_id"])
+        rows = [
+            row
+            for row in outbound_messages(message.id)
+            if str(row["group_id"]) == conversation_id
+        ]
+        if not rows:
+            return
+        if bridge["send_mode"] != "user":
+            log.info(
+                "Not editing GroupMe message for Discord %s: the bridge posts as a "
+                "GroupMe bot; switch to user mode to enable edits",
+                message.id,
+            )
+            return
+        if not GROUPME_ACCESS_TOKEN:
+            log.warning(
+                "Cannot edit GroupMe message for Discord %s: GROUPME_ACCESS_TOKEN is unset",
+                message.id,
+            )
+            return
+
+        try:
+            created_at = datetime.fromisoformat(rows[0]["created_at"])
+        except (TypeError, ValueError):
+            log.warning(
+                "Cannot determine GroupMe post time for Discord message %s; skipping edit",
+                message.id,
+            )
+            return
+        age_seconds = (utcnow() - created_at).total_seconds()
+        if age_seconds < 0 or age_seconds > GROUPME_EDIT_WINDOW_SECONDS:
+            log.info(
+                "Not editing GroupMe message for Discord %s: it is outside the 15-minute window",
+                message.id,
+            )
+            return
+
+        text = render_discord_content(message, await resolve_mention_names(message))
+        body, _ = format_discord_groupme_body(message, text)
+        try:
+            await groupme_edit_message(
+                self.groupme_session, conversation_id, str(rows[0]["groupme_id"]), truncate(body)
+            )
+        except GroupMeError as error:
+            log.warning(
+                "Could not edit GroupMe message for Discord %s in %s: %s",
+                message.id,
+                conversation_id,
+                error,
+            )
+            return
+        log.info(
+            "Edited GroupMe message %s in %s for Discord message %s",
+            rows[0]["groupme_id"],
+            conversation_id,
+            message.id,
+        )
 
     async def on_raw_message_delete(self, payload) -> None:
         await self.sync_discord_deletion(payload.message_id)

@@ -2,7 +2,7 @@ import asyncio
 import os
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -16,6 +16,7 @@ CREATED_BOTS = []
 UPLOADS = []
 CALLS = []
 DELETED_MESSAGES = []
+EDITED_GROUPME = []
 MESSAGE_READ_LIMITS = []
 EDITED_MESSAGES = []
 LATEST_MESSAGES = []
@@ -113,6 +114,17 @@ async def message_post(request):
     body = await request.json()
     POSTED_MESSAGE.append({"group_id": request.match_info["group_id"], **body["message"]})
     return web.json_response({"response": {"message": {"id": "9001", **body["message"]}}})
+
+
+async def message_edit(request):
+    body = await request.json()
+    edited = {
+        "group_id": request.match_info["group_id"],
+        "message_id": request.match_info["message_id"],
+        **body,
+    }
+    EDITED_GROUPME.append(edited)
+    return web.json_response({"response": {"message": edited}})
 
 
 async def pictures(request):
@@ -238,6 +250,21 @@ class BotMessage(Message):
     id = 1001
 
 
+class EditMessage:
+    def __init__(self, message_id, channel_id, content):
+        self.id = message_id
+        self.channel = SimpleNamespace(id=channel_id)
+        self.content = content
+        self.guild = object()
+        self.author = SimpleNamespace(display_name="Ann", name="ann", bot=False)
+        self.webhook_id = None
+        self.mentions = []
+        self.role_mentions = []
+        self.channel_mentions = []
+        self.attachments = []
+        self.reference = None
+
+
 class NickMember:
     """A guild member whose nickname is what GroupMe should see."""
 
@@ -287,6 +314,9 @@ async def main():
     app.router.add_get("/bots", bots_list)
     app.router.add_post("/bots/destroy", bots_destroy)
     app.router.add_post("/groups/{group_id}/messages", message_post)
+    app.router.add_put(
+        "/v4/groups/{group_id}/messages/{message_id}", message_edit
+    )
     app.router.add_get("/groups/{group_id}/messages", group_messages)
     app.router.add_delete("/conversations/{group_id}/messages/{message_id}", message_delete)
     app.router.add_get("/groups/{group_id}/subgroups", subgroups)
@@ -504,6 +534,31 @@ async def main():
             "9001",
             "9001",
         ], bot.outbound_messages(Message.id)
+
+        # Discord edits update token-authored GroupMe messages through the v4 endpoint.
+        EDITED_GROUPME.clear()
+        bot.client.groupme_session = session
+        await bot.client.sync_discord_edit(EditMessage(999, 888, "edited from Discord"))
+        assert EDITED_GROUPME[-1] == {
+            "group_id": "G3",
+            "message_id": "9001",
+            "text": "Ann: edited from Discord",
+        }, EDITED_GROUPME
+
+        # Posts created more than 15 minutes ago are left unchanged.
+        bot.add_outbound(
+            "G3",
+            8080,
+            "old-message",
+            datetime.now(timezone.utc) - timedelta(minutes=16),
+        )
+        await bot.client.sync_discord_edit(EditMessage(8080, 888, "too late to edit"))
+        assert len(EDITED_GROUPME) == 1, EDITED_GROUPME
+
+        # Bot-authored posts are not editable with the account's user token.
+        bot.add_outbound("G1", 8081, "bot-message", datetime.now(timezone.utc))
+        await bot.client.sync_discord_edit(EditMessage(8081, 555, "bot post edit"))
+        assert len(EDITED_GROUPME) == 1, EDITED_GROUPME
 
         # /bots/post returns nothing, so bot posts are matched back by text and picture
         now_epoch = int(datetime.now(timezone.utc).timestamp())

@@ -945,7 +945,7 @@ async def main():
             assert sent_payloads[-1]["content"] == "my reply"
             reply_view = sent_payloads[-1]["view"]
             assert len(reply_view.children) == 2, reply_view.children
-            assert reply_view.children[0].label == "Reply to: Bea"
+            assert reply_view.children[0].label == "↩️ Bea"
             assert reply_view.children[0].disabled
             assert reply_view.children[1].label == "the quoted original"
             assert reply_view.children[1].url == (
@@ -978,7 +978,7 @@ async def main():
             assert sent_payloads[-1]["view"].children[1].url == (
                 "https://discord.com/channels/123456/555/4249"
             )
-            assert sent_payloads[-1]["view"].children[0].label == "Reply to: Nick Name"
+            assert sent_payloads[-1]["view"].children[0].label == "↩️ Nick Name"
             assert sent_payloads[-1]["view"].children[1].label == "content"
 
             LATEST_MESSAGES[:] = [

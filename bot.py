@@ -3646,7 +3646,7 @@ class Bot(discord.Client):
         view = discord.ui.View(timeout=None)
         view.add_item(
             discord.ui.Button(
-                label=truncate(f"Reply to: {name}", 80),
+                label=truncate(f"↩️ {name}", 80),
                 style=discord.ButtonStyle.secondary,
                 disabled=True,
             )

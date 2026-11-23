@@ -195,7 +195,7 @@ Privacy settings are **bridge-wide** and keyed by the GroupMe **display name**, 
 - `anonymize` relays the message as **GroupMe user** with no avatar. The text itself is unchanged.
 - `opt out` does not relay that display name's messages at all; images and videos are not downloaded.
 
-`/privacy set name:<display name> mode:<share|anonymize|opt out>` manages a rule and `/privacy list` summarizes the current ones. When a GroupMe reply omits its quoted name or text, the bridge looks up the referenced message in recent history. For a mapped reply, the webhook keeps the sender's name/avatar and shows a disabled `Reply To: <name>` button plus a link button labeled with up to 80 characters of the referenced text. The link opens the mapped Discord message. An anonymized referenced user becomes `GroupMe user`; opted-out names and text are not exposed by reply buttons. If the original has no mapped Discord copy, the bridge logs a warning and falls back to the existing quote rendering.
+`/privacy set name:<display name> mode:<share|anonymize|opt out>` manages a rule and `/privacy list` summarizes the current ones. When a GroupMe reply omits its quoted name or text, the bridge looks up the referenced message in recent history. For a mapped reply, the webhook keeps the sender's name/avatar and shows a disabled `↩️ <name>` button plus a link button labeled with up to 80 characters of the referenced text. The link opens the mapped Discord message. An anonymized referenced user becomes `GroupMe user`; opted-out names and text are not exposed by reply buttons. If the original has no mapped Discord copy, the bridge logs a warning and falls back to the existing quote rendering.
 
 ## Behaviour notes
 

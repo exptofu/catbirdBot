@@ -33,6 +33,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 
@@ -1121,6 +1122,21 @@ def strip_emoji(text: str) -> str:
     return UNICODE_EMOJI_RE.sub("", text)
 
 
+def normalize_groupme_text(text: str) -> str:
+    # Preserve character offsets until GroupMe mention loci have been applied.
+    return "".join(
+        " " if char == "\ufffc" or unicodedata.category(char) == "Zs" else char
+        for char in text
+    )
+
+
+def plain_button_text(text: str) -> str:
+    plain = discord.utils.remove_markdown(normalize_groupme_text(text)).replace(
+        r"\@", "@"
+    )
+    return re.sub(r"[^\S\r\n]+", " ", plain)
+
+
 async def resolve_mention_names(message: discord.Message) -> dict[int, str]:
     """Map mentioned user ids to the nickname they use in this server.
 
@@ -1208,13 +1224,14 @@ def groupme_reply_quote(attachment: dict) -> str:
     both the name and the quoted text.
     """
     name = (attachment.get("name") or "").strip()
-    quoted = (attachment.get("text") or "").strip()
+    quoted = normalize_groupme_text(attachment.get("text") or "").strip()
     privacy = groupme_user_mode(name)
     if privacy == PRIVACY_OPTOUT:
         return "> (replying to a GroupMe user who opted out of Discord sharing)"
     if privacy == PRIVACY_ANONYMIZE and name:
         name = ANONYMOUS_GROUPME_NAME
     quoted = render_groupme_mentions(quoted, attachment.get("attachments"))
+    quoted = re.sub(r"[^\S\r\n]+", " ", quoted)
     quoted = truncate(strip_emoji(CUSTOM_EMOJI_RE.sub("", quoted)), 120)
     if quoted:
         lines = quoted.splitlines()
@@ -1282,18 +1299,22 @@ async def resolve_groupme_reply(
     return message
 
 
-def render_groupme_mentions(text: str, attachments: list[dict] | None) -> str:
-    r"""Bold each GroupMe mention and defuse it so Discord cannot ping anyone.
+def render_groupme_mentions(
+    text: str, attachments: list[dict] | None, *, bold: bool = True
+) -> str:
+    r"""Defuse GroupMe mentions so Discord cannot ping anyone.
 
     GroupMe sends a mention as `{"type": "mentions", "loci": [[start, length]],
     "user_ids": [...]}` while the display name only exists inside `text`; the
     attachment itself carries no name, so rendering it as `[mentions]` adds nothing.
     Ranges are applied from the end so earlier offsets stay valid, and the `@` is
-    escaped as `\@` so a Discord member with the same name is never mentioned.
+    escaped as `\@` when bolded so a Discord member with the same name is never
+    mentioned. Button previews use plain text instead.
     Display-name privacy applies here too, and an opted-out mention is anonymized
     rather than dropped: dropping it leaves a hole in someone else's sentence. So both
     `anonymize` and `optout` render as `**\@GroupMe user**`.
     """
+    text = normalize_groupme_text(text)
     ranges: list[tuple[int, int]] = []
     for attachment in attachments or []:
         if (attachment.get("type") or "").lower() != "mentions":
@@ -1315,7 +1336,8 @@ def render_groupme_mentions(text: str, attachments: list[dict] | None) -> str:
         privacy = groupme_user_mode(name)
         if privacy in (PRIVACY_ANONYMIZE, PRIVACY_OPTOUT):
             name = ANONYMOUS_GROUPME_NAME
-        rendered = rendered[:start] + f"**\\@{name}**" + rendered[end:]
+        mention = f"**\\@{name}**" if bold else f"@{name}"
+        rendered = rendered[:start] + mention + rendered[end:]
     return rendered
 
 
@@ -1324,7 +1346,8 @@ def groupme_message_text(message: dict, *, include_reply_quote: bool = True) -> 
     quotes: list[str] = []
     attachments = message.get("attachments") or []
     # Mentions are resolved against the raw text, before trimming shifts the offsets.
-    text = render_groupme_mentions(message.get("text") or "", attachments).strip()
+    text = render_groupme_mentions(message.get("text") or "", attachments)
+    text = re.sub(r"[^\S\r\n]+", " ", text).strip()
     if text:
         parts.append(text)
     for attachment in attachments:
@@ -3650,8 +3673,15 @@ class Bot(discord.Client):
             )
             return None
 
-        preview = (original.clean_content or attachment.get("text") or "").strip()
-        preview = render_groupme_mentions(preview, attachment.get("attachments"))
+        name = plain_button_text(name)
+        preview = original.clean_content or ""
+        if not preview:
+            preview = render_groupme_mentions(
+                attachment.get("text") or "",
+                attachment.get("attachments"),
+                bold=False,
+            )
+        preview = plain_button_text(preview)
         preview = " ".join(strip_emoji(CUSTOM_EMOJI_RE.sub("", preview)).split())
         view = discord.ui.View(timeout=None)
         view.add_item(

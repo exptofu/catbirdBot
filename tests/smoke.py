@@ -217,6 +217,18 @@ assert "[reply]" not in bot.groupme_message_text({"text": "x", "attachments": [{
 # a reply whose quoted text is known but whose author is not
 assert bot.groupme_message_text({"attachments": [{"type": "reply", "text": "hi"}]}) == "> hi"
 
+# malformed object placeholders and nonbreaking spaces are normalized in GroupMe text
+unicode_text = (
+    "If someone has it, any chance you \u00a0\ufffc could DM me "
+    "Heather Arrowwood\u2018s phone number? \ufffc"
+)
+unicode_rendered = bot.groupme_message_text({"text": unicode_text})
+assert unicode_rendered == (
+    "If someone has it, any chance you could DM me "
+    "Heather Arrowwood\u2018s phone number?"
+), unicode_rendered
+assert "\ufffc" not in unicode_rendered and "\u00a0" not in unicode_rendered
+
 # GroupMe mentions become bold, backslash-escaped names, never a [mentions] token
 mention_text = "@Leigh McDougal @John Snarey - hello"
 mention_message = {
@@ -230,6 +242,10 @@ assert "[mentions]" not in rendered_mentions, rendered_mentions
 assert r"**\@Leigh McDougal**" in rendered_mentions, rendered_mentions
 assert r"**\@John Snarey**" in rendered_mentions, rendered_mentions
 assert "\u200b" not in rendered_mentions, rendered_mentions
+plain_mentions = bot.render_groupme_mentions(
+    mention_text, mention_message["attachments"], bold=False
+)
+assert plain_mentions == "@Leigh McDougal @John Snarey - hello", plain_mentions
 # a mentions attachment with no text at all renders nothing instead of a marker
 assert bot.groupme_message_text({"attachments": [{"type": "mentions"}]}) == ""
 # an empty or out-of-range loci is left as plain text rather than raising

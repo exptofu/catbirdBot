@@ -824,6 +824,13 @@ async def main():
             async def fetch_message(self, message_id):
                 return self.messages[message_id]
 
+        preview_source = "DM me \ufffcHeather Arrowwood\u00a0number\ufffc"
+        preview_mentions = [
+            {
+                "type": "mentions",
+                "loci": [[preview_source.index("Heather"), len("Heather Arrowwood")]],
+            }
+        ]
         UploadChannel.messages = {
             4247: SimpleNamespace(
                 author=SimpleNamespace(display_name="Bea", name="Bea"),
@@ -843,6 +850,13 @@ async def main():
                 ),
                 clean_content="content",
                 webhook_id=None,
+            ),
+            4250: SimpleNamespace(
+                author=SimpleNamespace(display_name="Bea", name="Bea"),
+                clean_content=bot.groupme_message_text(
+                    {"text": preview_source, "attachments": preview_mentions}
+                ),
+                webhook_id=123,
             ),
         }
         bot.client.get_channel = lambda _channel_id: UploadChannel()
@@ -990,6 +1004,34 @@ async def main():
             )
             assert sent_payloads[-1]["view"].children[0].label == "↩️ Nick Name"
             assert sent_payloads[-1]["view"].children[1].label == "content"
+
+            # Linked previews are plain text and do not reapply raw mention offsets
+            # to content that already contains rendered Markdown.
+            bot.add_outbound("G1", 4250, "9690", datetime.now(timezone.utc))
+            await bot.client.process_groupme_message(
+                {
+                    "id": "9612",
+                    "group_id": "G1",
+                    "sender_type": "user",
+                    "user_id": "u2",
+                    "name": "Ann",
+                    "text": "reply with link",
+                    "attachments": [
+                        {
+                            "type": "reply",
+                            "reply_id": "9690",
+                            "text": preview_source,
+                            "attachments": preview_mentions,
+                        }
+                    ],
+                    "created_at": now_epoch,
+                },
+                source="test",
+            )
+            preview_button = sent_payloads[-1]["view"].children[1]
+            assert preview_button.label == "DM me @Heather Arrowwood number"
+            assert "**" not in preview_button.label and r"\@" not in preview_button.label
+            assert "\ufffc" not in preview_button.label and "\u00a0" not in preview_button.label
 
             LATEST_MESSAGES[:] = [
                 {

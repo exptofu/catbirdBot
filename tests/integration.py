@@ -324,6 +324,7 @@ async def main():
     app.router.add_get("/groups", group_index)
     app.router.add_post("/images/pictures", pictures)
     app.router.add_get("/cdn/a.png", cdn)
+    app.router.add_get("/cdn/b.png", cdn)
     app.router.add_get("/cdn/video.mp4", video_cdn)
     app.router.add_get("/flaky", flaky)
     runner = web.AppRunner(app)
@@ -454,14 +455,27 @@ async def main():
         assert bot.last_seen("G1") == "12"
         bot.client.process_groupme_message = original_process
 
-        # bot mode: text first, then one picture per image, both re-hosted
+        # bot mode: text and all images are attached to one bot message
         POSTED_BOT.clear()
         UPLOADS.clear()
         await bot.relay_discord_message(session, Message(), bot.bridge_for_conversation("G1"))
-        assert POSTED_BOT[0] == {"bot_id": "bot-1", "text": "Ann: hello group\nhttps://cdn.discordapp.com/b.pdf"}, POSTED_BOT[0]
-        assert POSTED_BOT[1] == {"bot_id": "bot-1", "text": "Ann:", "picture_url": "https://i.groupme.com/test.jpg"}, POSTED_BOT[1]
+        assert POSTED_BOT == [{
+            "bot_id": "bot-1",
+            "text": "Ann: hello group\nhttps://cdn.discordapp.com/b.pdf",
+            "attachments": [{"type": "image", "url": "https://i.groupme.com/test.jpg"}],
+        }], POSTED_BOT
         assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
         assert max(UPLOADS[0]["dims"]) <= 2048, UPLOADS[0]
+
+        multi = Message()
+        multi.attachments = [
+            Attachment("http://127.0.0.1:8731/cdn/a.png", "image/png", "a.png"),
+            Attachment("http://127.0.0.1:8731/cdn/b.png", "image/png", "b.png"),
+        ]
+        POSTED_BOT.clear()
+        await bot.relay_discord_message(session, multi, bot.bridge_for_conversation("G1"))
+        assert len(POSTED_BOT) == 1, POSTED_BOT
+        assert len(POSTED_BOT[0]["attachments"]) == 2, POSTED_BOT
 
         original_message = Mock(spec=discord.Message)
         original_message.id = 1001
@@ -561,6 +575,17 @@ async def main():
         assert POSTED_MESSAGE[0]["group_id"] == "G3", POSTED_MESSAGE[0]
         assert POSTED_MESSAGE[0]["text"].startswith("Ann: hello group"), POSTED_MESSAGE[0]
         assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
+        multi = Message()
+        multi.attachments = [
+            Attachment("http://127.0.0.1:8731/cdn/a.png", "image/png", "a.png"),
+            Attachment("http://127.0.0.1:8731/cdn/b.png", "image/png", "b.png"),
+        ]
+        POSTED_MESSAGE.clear()
+        await bot.relay_discord_message(
+            session, multi, bot.bridge_for_conversation("G3")
+        )
+        assert len(POSTED_MESSAGE) == 1, POSTED_MESSAGE
+        assert len(POSTED_MESSAGE[0]["attachments"]) == 2, POSTED_MESSAGE
         bot.add_link(
             bot.LINK_GROUPME,
             "G3",
@@ -616,16 +641,6 @@ async def main():
         now_epoch = int(datetime.now(timezone.utc).timestamp())
         LATEST_MESSAGES[:] = [
             {
-                "id": "9102",
-                "group_id": "G1",
-                "sender_type": "bot",
-                "user_id": "b1",
-                "name": "Catbird Bridge",
-                "text": "Ann:",
-                "created_at": now_epoch,
-                "attachments": [{"type": "image", "url": "https://i.groupme.com/test.jpg"}],
-            },
-            {
                 "id": "9101",
                 "group_id": "G1",
                 "sender_type": "bot",
@@ -633,21 +648,21 @@ async def main():
                 "name": "Catbird Bridge",
                 "text": "Ann: hello group\nhttps://cdn.discordapp.com/b.pdf",
                 "created_at": now_epoch,
+                "attachments": [{"type": "image", "url": "https://i.groupme.com/test.jpg"}],
             },
         ]
         POSTED_BOT.clear()
         bot.save_bridge("G1", 555, "bot-1", "Testers", group_name="Testers")
         await bot.relay_discord_message(session, BotMessage(), bot.bridge_for_conversation("G1"))
-        assert sorted(row["groupme_id"] for row in bot.outbound_messages(BotMessage.id)) == [
-            "9101",
-            "9102",
+        assert [row["groupme_id"] for row in bot.outbound_messages(BotMessage.id)] == [
+            "9101"
         ], bot.outbound_messages(BotMessage.id)
 
         # deleting the Discord message deletes every GroupMe copy it produced
         bot.client.groupme_session = session
         DELETED_MESSAGES.clear()
         await bot.client.sync_discord_deletion(BotMessage.id)
-        assert sorted(DELETED_MESSAGES) == [("G1", "9101"), ("G1", "9102")], DELETED_MESSAGES
+        assert DELETED_MESSAGES == [("G1", "9101")], DELETED_MESSAGES
         assert bot.outbound_messages(BotMessage.id) == [], bot.outbound_messages(BotMessage.id)
 
         # thread destinations pass the thread id; plain channels must omit it

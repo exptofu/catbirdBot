@@ -57,7 +57,7 @@ assert bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 assert bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 assert not bot.link_exists("nope", "12345678", "555")
 
-# a Discord message can map to several GroupMe messages (text plus one per image)
+# a Discord message can map to several GroupMe messages (combined text/image plus later images)
 bot.add_outbound("12345678", 2222, "555", datetime.now(timezone.utc))
 bot.add_outbound("12345678", 2222, "556", datetime.now(timezone.utc))
 assert sorted(row["groupme_id"] for row in bot.outbound_messages(2222)) == ["555", "556"]

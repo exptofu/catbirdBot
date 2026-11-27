@@ -241,8 +241,7 @@ CREATE_SQL = f"""
         PRIMARY KEY (group_id, source_id)
     );
     -- Discord message -> GroupMe message(s) posted by the bridge, for deletion sync.
-    -- One Discord message can become several GroupMe messages: the text post plus
-    -- one picture post per image, because /bots/post returns no message id.
+    -- One Discord message can become one or more GroupMe messages.
     CREATE TABLE IF NOT EXISTS outbound_messages (
         group_id TEXT NOT NULL,
         discord_id TEXT NOT NULL,
@@ -1799,9 +1798,15 @@ async def relay_discord_message(
         )
     else:
         bot_id = bridge["bot_id"]
+        bot_attachments = [{"type": "image", "url": url} for url in hosted]
+        if reply_attachment:
+            bot_attachments.append(reply_attachment)
         try:
             await groupme_post_bot(
-                session, bot_id, body, attachments=[reply_attachment] if reply_attachment else None
+                session,
+                bot_id,
+                body,
+                attachments=bot_attachments or None,
             )
         except GroupMeError as error:
             # GroupMe answers 404 when the bot id no longer exists (deleted, recreated,
@@ -1810,12 +1815,12 @@ async def relay_discord_message(
                 raise
             bot_id = await recover_bot_id(session, bridge)
             await groupme_post_bot(
-                session, bot_id, body, attachments=[reply_attachment] if reply_attachment else None
+                session,
+                bot_id,
+                body,
+                attachments=bot_attachments or None,
             )
-        posts: list[tuple[str, str]] = [(body, "")]
-        for image_url in hosted:
-            await groupme_post_bot(session, bot_id, header, picture_url=image_url)
-            posts.append((header, image_url))
+        posts: list[tuple[str, str]] = [(body, hosted[0] if hosted else "")]
         await record_bot_posts(
             session, outbound_conversation_id(bridge), message.id, posts
         )

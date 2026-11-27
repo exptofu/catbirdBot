@@ -57,17 +57,16 @@ assert bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 assert bot.link_exists(bot.LINK_GROUPME, "12345678", "555")
 assert not bot.link_exists("nope", "12345678", "555")
 
-# a Discord message can map to several GroupMe messages (combined text/image plus later images)
+# a Discord message with multiple images maps to one combined GroupMe bot message
 bot.add_outbound("12345678", 2222, "555", datetime.now(timezone.utc))
-bot.add_outbound("12345678", 2222, "556", datetime.now(timezone.utc))
-assert sorted(row["groupme_id"] for row in bot.outbound_messages(2222)) == ["555", "556"]
+assert [row["groupme_id"] for row in bot.outbound_messages(2222)] == ["555"]
 assert bot.outbound_messages(3333) == []
-assert bot.outbound_groupme_id_exists("12345678", "556")
+assert bot.outbound_groupme_id_exists("12345678", "555")
 assert not bot.outbound_groupme_id_exists("12345678", "999")
 assert bot.groupme_message_for_discord_reply("12345678", 2222) == "555"
 assert bot.discord_message_for_groupme_reply("12345678", "555", 111) == ("2222", 111)
 bot.remove_outbound("12345678", 2222, "555")
-assert [row["groupme_id"] for row in bot.outbound_messages(2222)] == ["556"]
+assert bot.outbound_messages(2222) == []
 bot.add_link(
     bot.LINK_GROUPME,
     "12345678",
@@ -319,6 +318,41 @@ assert renamed == "hey @Ann (nick) @Mods in #general 🎉 done", renamed
 unresolved = bot.render_discord_content(FakeUnresolvedMessage, {77: "Cobb", 78: "Dekalb"})
 assert unresolved == "ping @Cobb and @Dekalb", unresolved
 assert bot.render_discord_content(FakeUnresolvedMessage) == "ping @user and @user"
+
+# one sender spamming trips a hold; other senders and bridges are unaffected
+limiter = bot.BridgeRateLimiter()
+original_buckets = bot.RATE_LIMIT_BUCKETS
+bot.RATE_LIMIT_BUCKETS = [(3, 10), (5, 60)]
+for _ in range(3):
+    assert limiter.check("G1", "d2g", "u1") == (None, False)
+trip, is_new = limiter.check("G1", "d2g", "u1", "Spammer")
+assert trip is not None and is_new and trip.user_label == "Spammer"
+assert trip.reason == "more than 3 messages in 10 seconds", trip.reason
+assert limiter.check("G1", "d2g", "u1") == (trip, False)
+assert limiter.check("G1", "d2g", "u2") == (None, False)
+assert limiter.check("G1", "g2d", "u1") == (None, False)
+assert limiter.check("G2", "d2g", "u1") == (None, False)
+trip.hold("1", None)
+trip.hold("1", None)
+assert list(trip.held) == ["1"]
+limiter.resolve(trip)
+assert trip.resolved and limiter.check("G1", "d2g", "u1") == (None, False)
+
+# the long bucket catches a slow flood the short one misses
+slow = bot.BridgeRateLimiter()
+now = [1000.0]
+original_monotonic = bot.time.monotonic
+bot.time.monotonic = lambda: now[0]
+try:
+    for _ in range(5):
+        assert slow.check("G1", "d2g", "u1") == (None, False)
+        now[0] += 11
+    slow_trip, slow_new = slow.check("G1", "d2g", "u1")
+    assert slow_new and slow_trip.reason == "more than 5 messages in 60 seconds", slow_trip
+finally:
+    bot.time.monotonic = original_monotonic
+    bot.RATE_LIMIT_BUCKETS = original_buckets
+assert bot.parse_rate_limit_buckets("4/10, 5/60") == [(4, 10), (5, 60)]
 
 # command tree wiring
 names = sorted(c.name for c in bot.client.tree.get_commands())

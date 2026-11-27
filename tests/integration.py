@@ -256,7 +256,7 @@ class EditMessage:
         self.channel = SimpleNamespace(id=channel_id)
         self.content = content
         self.guild = object()
-        self.author = SimpleNamespace(display_name="Ann", name="ann", bot=False)
+        self.author = SimpleNamespace(id=1, display_name="Ann", name="ann", bot=False)
         self.webhook_id = None
         self.mentions = []
         self.role_mentions = []
@@ -455,14 +455,14 @@ async def main():
         assert bot.last_seen("G1") == "12"
         bot.client.process_groupme_message = original_process
 
-        # bot mode: text and all images are attached to one bot message
+        # bot mode: the text carries the first image; bots cannot send more than one per message
         POSTED_BOT.clear()
         UPLOADS.clear()
         await bot.relay_discord_message(session, Message(), bot.bridge_for_conversation("G1"))
         assert POSTED_BOT == [{
             "bot_id": "bot-1",
             "text": "Ann: hello group\nhttps://cdn.discordapp.com/b.pdf",
-            "attachments": [{"type": "image", "url": "https://i.groupme.com/test.jpg"}],
+            "picture_url": "https://i.groupme.com/test.jpg",
         }], POSTED_BOT
         assert UPLOADS[0]["content_type"] == "image/jpeg", UPLOADS[0]
         assert max(UPLOADS[0]["dims"]) <= 2048, UPLOADS[0]
@@ -474,8 +474,8 @@ async def main():
         ]
         POSTED_BOT.clear()
         await bot.relay_discord_message(session, multi, bot.bridge_for_conversation("G1"))
-        assert len(POSTED_BOT) == 1, POSTED_BOT
-        assert len(POSTED_BOT[0]["attachments"]) == 2, POSTED_BOT
+        assert len(POSTED_BOT) == 2, POSTED_BOT
+        assert POSTED_BOT[1]["text"] == "Ann:", POSTED_BOT
 
         original_message = Mock(spec=discord.Message)
         original_message.id = 1001
@@ -664,6 +664,58 @@ async def main():
         await bot.client.sync_discord_deletion(BotMessage.id)
         assert DELETED_MESSAGES == [("G1", "9101")], DELETED_MESSAGES
         assert bot.outbound_messages(BotMessage.id) == [], bot.outbound_messages(BotMessage.id)
+
+        # one sender's burst is held until a moderator answers; others keep flowing
+        original_limit = bot.RATE_LIMIT_BUCKETS
+        original_alert = bot.client.send_rate_limit_alert
+        alerts = []
+
+        async def fake_alert(bridge, trip):
+            alerts.append(trip)
+            return True
+
+        bot.RATE_LIMIT_BUCKETS = [(2, 60)]
+        bot.RATE_LIMIT_ENABLED = True
+        original_notice = bot.client.send_rate_limit_notice
+        original_directions = bot.RATE_LIMIT_DIRECTIONS
+        notices = []
+
+        async def fake_notice(channel, trip):
+            notices.append(trip.user_id)
+
+        bot.client.send_rate_limit_notice = fake_notice
+        bot.RATE_LIMIT_DIRECTIONS = {"discord_to_groupme"}
+        bot.client.send_rate_limit_alert = fake_alert
+        bot.RATE_LIMITER.recent.clear()
+        try:
+            POSTED_BOT.clear()
+            for number in range(5000, 5004):
+                await bot.client.on_message(EditMessage(number, 555, "spam"))
+            assert len(POSTED_BOT) == 2, POSTED_BOT
+            assert len(alerts) == 1 and len(alerts[0].held) == 2, alerts
+            assert notices == ["1"], notices
+            other = EditMessage(5005, 555, "hello")
+            other.author = SimpleNamespace(id=2, display_name="Bea", name="bea", bot=False)
+            await bot.client.on_message(other)
+            assert len(POSTED_BOT) == 3, POSTED_BOT
+            await bot.client.finish_rate_limit(alerts[0], allow=True)
+            assert len(POSTED_BOT) == 5, POSTED_BOT
+
+            for number in range(5010, 5013):
+                await bot.client.on_message(EditMessage(number, 555, "spam"))
+            assert len(POSTED_BOT) == 7 and len(alerts) == 2, POSTED_BOT
+            await bot.client.finish_rate_limit(alerts[1], allow=False)
+            assert len(POSTED_BOT) == 7, POSTED_BOT
+            await bot.client.on_message(EditMessage(5020, 555, "normal again"))
+            assert len(POSTED_BOT) == 8, POSTED_BOT
+        finally:
+            bot.RATE_LIMIT_BUCKETS = original_limit
+            bot.RATE_LIMIT_ENABLED = False  # later tests send many messages from one sender
+            bot.client.send_rate_limit_notice = original_notice
+            bot.RATE_LIMIT_DIRECTIONS = original_directions
+            bot.client.send_rate_limit_alert = original_alert
+            bot.RATE_LIMITER.recent.clear()
+            bot.RATE_LIMITER.tripped.clear()
 
         # thread destinations pass the thread id; plain channels must omit it
         webhook_calls = []

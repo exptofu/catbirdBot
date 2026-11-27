@@ -65,8 +65,9 @@ a constraint that has already bitten us once.
   `event.type == "message.deleted"` naming the original id. Handle both, and keep the
   newest-`<GROUPME_HISTORY_LIMIT>` comparison as the fallback.
 - **Deletion links**: `outbound_messages` maps one Discord id to every GroupMe id it
-  produced (a bot message becomes one text post plus one picture post per image, and
-  `/bots/post` returns no id, so `record_bot_posts` matches them by text and image URL).
+  produced (a bot message is one post carrying the text and first image, plus one
+  picture post per extra image, because bots cannot send more than one image per
+  message; `/bots/post` returns no id, so `record_bot_posts` matches them by text and image URL).
   `message_links` rows with `target_id IS NULL` are the bridge's own token posts and must
   stay out of the reconciliation that deletes Discord copies.
 

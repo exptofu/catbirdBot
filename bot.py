@@ -35,7 +35,9 @@ import sqlite3
 import time
 import unicodedata
 import uuid
+from collections import deque
 from datetime import datetime, timezone
+from typing import Awaitable, Callable
 
 import aiohttp
 import discord
@@ -81,6 +83,36 @@ SYNC_DELETIONS = os.environ.get("SYNC_DELETIONS", "true").strip().lower() not in
 # GroupMe edits are found by checking this recent history window; the same check
 # catches deleted-message tombstones and missed `message.deleted` events.
 GROUPME_DELETE_CHECK_SECONDS = max(60, int(os.environ.get("GROUPME_DELETE_CHECK_SECONDS", "60")))
+# A sender (GroupMe user id or Discord author) who relays more than N messages through
+# one bridge direction within any S-second bucket is paused: their further messages are
+# held while a moderator decides, and the alert goes to MODERATOR_CHANNEL_NAME. Held
+# messages are dropped if nobody answers within RATE_LIMIT_ALERT_SECONDS.
+# RATE_LIMIT_BUCKETS is "N/S,N/S": the short bucket catches bursts, the long one slow
+# floods. In catbird.db the busiest whole bridge peaked at 3 messages in 10 seconds and
+# 5 in 60 seconds, so one sender passing either is unusual.
+RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+# Which directions are limited: "discord_to_groupme", "groupme_to_discord" or both,
+# comma separated. Only Discord senders get the in-channel notice.
+RATE_LIMIT_DIRECTIONS = {
+    part.strip().lower()
+    for part in os.environ.get("RATE_LIMIT_DIRECTIONS", "discord_to_groupme").split(",")
+    if part.strip()
+}
+
+
+def parse_rate_limit_buckets(raw: str) -> list[tuple[int, int]]:
+    buckets = []
+    for part in raw.split(","):
+        if part.strip():
+            messages, _, seconds = part.partition("/")
+            buckets.append((max(1, int(messages)), max(1, int(seconds))))
+    return buckets or [(4, 10), (10, 60)]
+
+
+RATE_LIMIT_BUCKETS = parse_rate_limit_buckets(os.environ.get("RATE_LIMIT_BUCKETS", "4/10,10/60"))
+RATE_LIMIT_HOLD_LIMIT = max(1, int(os.environ.get("RATE_LIMIT_HOLD_LIMIT", "50")))
+RATE_LIMIT_ALERT_SECONDS = max(60, int(os.environ.get("RATE_LIMIT_ALERT_SECONDS", "1800")))
+MODERATOR_CHANNEL_NAME = os.environ.get("MODERATOR_CHANNEL_NAME", "moderator-only").strip() or "moderator-only"
 # Loopback by default: the ngrok tunnel forwards to localhost, so nothing has to be
 # reachable from the internet (the callback path has no authentication of its own).
 # Set GROUPME_WEBHOOK_HOST=0.0.0.0 only when a proxy on another host needs to connect.
@@ -1798,15 +1830,17 @@ async def relay_discord_message(
         )
     else:
         bot_id = bridge["bot_id"]
-        bot_attachments = [{"type": "image", "url": url} for url in hosted]
-        if reply_attachment:
-            bot_attachments.append(reply_attachment)
+        # Bot posts render only one image, so the first rides with the text and any
+        # others go as follow-up posts. `/bridge set-mode user` keeps them all in one.
+        first_image = hosted[0] if hosted else None
+        bot_attachments = [reply_attachment] if reply_attachment else None
         try:
             await groupme_post_bot(
                 session,
                 bot_id,
                 body,
-                attachments=bot_attachments or None,
+                picture_url=first_image,
+                attachments=bot_attachments,
             )
         except GroupMeError as error:
             # GroupMe answers 404 when the bot id no longer exists (deleted, recreated,
@@ -1818,9 +1852,13 @@ async def relay_discord_message(
                 session,
                 bot_id,
                 body,
-                attachments=bot_attachments or None,
+                picture_url=first_image,
+                attachments=bot_attachments,
             )
-        posts: list[tuple[str, str]] = [(body, hosted[0] if hosted else "")]
+        posts: list[tuple[str, str]] = [(body, first_image or "")]
+        for image_url in hosted[1:]:
+            await groupme_post_bot(session, bot_id, header, picture_url=image_url)
+            posts.append((header, image_url))
         await record_bot_posts(
             session, outbound_conversation_id(bridge), message.id, posts
         )
@@ -2816,7 +2854,8 @@ async def bridge_remove(interaction: discord.Interaction):
 @app_commands.describe(
     mode=(
         "user posts as the access-token account (GroupMe returns the message id, so "
-        "Discord deletions remove it); bot posts as the GroupMe bot"
+        "Discord deletions remove it, and all images stay in one message); bot posts as "
+        "the GroupMe bot, which can send only one image per message"
     )
 )
 @app_commands.choices(
@@ -3269,6 +3308,182 @@ async def privacy_list(interaction: discord.Interaction):
 # --------------------------------------------------------------------------- #
 # Discord client
 # --------------------------------------------------------------------------- #
+
+
+DIRECTION_TO_DISCORD = "groupme_to_discord"
+DIRECTION_TO_GROUPME = "discord_to_groupme"
+DIRECTION_LABELS = {
+    DIRECTION_TO_DISCORD: "GroupMe → Discord",
+    DIRECTION_TO_GROUPME: "Discord → GroupMe",
+}
+
+
+class RateLimitTrip:
+    """A paused sender in one bridge direction: messages wait here for a moderator."""
+
+    def __init__(
+        self,
+        conversation_id: str,
+        direction: str,
+        user_id: str,
+        user_label: str,
+        reason: str = "",
+    ) -> None:
+        self.reason = reason
+        self.conversation_id = conversation_id
+        self.direction = direction
+        self.user_id = user_id
+        self.user_label = user_label
+        # item id -> (release, drop); a dict so a re-polled GroupMe message is held once.
+        self.held: dict[
+            str, tuple[Callable[[], Awaitable[None]], Callable[[], None] | None]
+        ] = {}
+        self.overflow = 0
+        self.resolved = False
+
+    def hold(
+        self,
+        item_id: str,
+        release: Callable[[], Awaitable[None]],
+        drop: Callable[[], None] | None = None,
+    ) -> None:
+        if item_id in self.held:
+            return
+        if len(self.held) >= RATE_LIMIT_HOLD_LIMIT:
+            self.overflow += 1
+            if drop is not None:
+                drop()
+            return
+        self.held[item_id] = (release, drop)
+
+
+class BridgeRateLimiter:
+    """Sliding-window message counter per bridge, direction and sender."""
+
+    def __init__(self) -> None:
+        self.recent: dict[tuple[str, str, str], deque[float]] = {}
+        self.tripped: dict[tuple[str, str, str], RateLimitTrip] = {}
+
+    def check(
+        self, conversation_id: str, direction: str, user_id: str, user_label: str = ""
+    ) -> tuple[RateLimitTrip | None, bool]:
+        """Count one message; return the trip to hold it in, and whether it is new."""
+        key = (conversation_id, direction, user_id)
+        trip = self.tripped.get(key)
+        if trip is not None:
+            return trip, False
+        now = time.monotonic()
+        stamps = self.recent.setdefault(key, deque())
+        longest = max(seconds for _, seconds in RATE_LIMIT_BUCKETS)
+        while stamps and now - stamps[0] > longest:
+            stamps.popleft()
+        reason = ""
+        for messages, seconds in RATE_LIMIT_BUCKETS:
+            if sum(1 for stamp in stamps if now - stamp <= seconds) >= messages:
+                reason = f"more than {messages} messages in {seconds} seconds"
+                break
+        if not reason:
+            stamps.append(now)
+            return None, False
+        trip = RateLimitTrip(
+            conversation_id, direction, user_id, user_label or user_id, reason
+        )
+        self.tripped[key] = trip
+        return trip, True
+
+    def resolve(self, trip: RateLimitTrip) -> None:
+        """Resume the sender with a fresh counter."""
+        trip.resolved = True
+        key = (trip.conversation_id, trip.direction, trip.user_id)
+        if self.tripped.get(key) is trip:
+            del self.tripped[key]
+        self.recent.pop(key, None)
+
+
+RATE_LIMITER = BridgeRateLimiter()
+
+
+class RateLimitView(discord.ui.View):
+    """Moderator buttons on a high-traffic alert."""
+
+    def __init__(self, client: "Bot", trip: RateLimitTrip) -> None:
+        super().__init__(timeout=RATE_LIMIT_ALERT_SECONDS)
+        self.client = client
+        self.trip = trip
+        self.message: discord.Message | None = None
+
+    async def decide(self, interaction: discord.Interaction, allow: bool) -> None:
+        user = interaction.user
+        if not isinstance(user, discord.Member) or not user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "Only administrators can answer this alert.", ephemeral=True
+            )
+            return
+        if self.trip.resolved:
+            await interaction.response.send_message(
+                "This alert was already handled.", ephemeral=True
+            )
+            return
+        count = len(self.trip.held)
+        await self.client.finish_rate_limit(self.trip, allow=allow)
+        self.stop()
+        verdict = (
+            f"✅ Allowed by {user.mention}: {count} held message(s) were relayed."
+            if allow
+            else f"🚫 Suppressed by {user.mention}: {count} held message(s) were dropped."
+        )
+        await interaction.response.edit_message(
+            embed=rate_limit_embed(
+                self.trip, verdict, discord.Color.green() if allow else discord.Color.red()
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Suppress", style=discord.ButtonStyle.danger)
+    async def suppress(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.decide(interaction, allow=False)
+
+    @discord.ui.button(label="Allow", style=discord.ButtonStyle.success)
+    async def allow(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.decide(interaction, allow=True)
+
+    async def on_timeout(self) -> None:
+        if self.trip.resolved:
+            return
+        count = len(self.trip.held)
+        await self.client.finish_rate_limit(self.trip, allow=False)
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    embed=rate_limit_embed(
+                        self.trip,
+                        f"⌛ No answer in time: {count} held message(s) were dropped "
+                        "and relaying resumed.",
+                        discord.Color.dark_grey(),
+                    ),
+                    view=None,
+                )
+            except discord.HTTPException:
+                log.debug("Could not update the expired rate limit alert", exc_info=True)
+
+
+def rate_limit_embed(trip: RateLimitTrip, status: str, color: discord.Color) -> discord.Embed:
+    bridge = bridge_for_conversation(trip.conversation_id)
+    where = conversation_label(bridge) if bridge is not None else trip.conversation_id
+    embed = discord.Embed(
+        title="🚨 High traffic from one sender",
+        description=(
+            f"**{trip.user_label}** sent {trip.reason} on **{where}** "
+            f"({DIRECTION_LABELS[trip.direction]}), so their messages are paused.\n\n{status}"
+        ),
+        color=color,
+    )
+    if bridge is not None:
+        embed.add_field(name="Channel", value=destination_label(bridge), inline=True)
+    embed.add_field(name="Held", value=str(len(trip.held)), inline=True)
+    if trip.overflow:
+        embed.add_field(name="Dropped over the hold limit", value=str(trip.overflow), inline=True)
+    return embed
 
 
 class Bot(discord.Client):
@@ -3738,7 +3953,9 @@ class Bot(discord.Client):
 
         task.add_done_callback(report)
 
-    async def process_groupme_message(self, message: dict, *, source: str) -> None:
+    async def process_groupme_message(
+        self, message: dict, *, source: str, check_rate_limit: bool = True
+    ) -> None:
         group_id = str(message.get("group_id") or "")
         message_id = str(message.get("id") or "")
         if not group_id:
@@ -3795,6 +4012,33 @@ class Bot(discord.Client):
             return
 
         content_hash = groupme_message_content_hash(message)
+        if check_rate_limit:
+            source_message = message
+
+            def drop_held() -> None:
+                # Remember the id so the poller does not relay a suppressed message later.
+                add_link(
+                    LINK_GROUPME,
+                    group_id,
+                    int(bridge["channel_id"]),
+                    message_id,
+                    None,
+                    from_epoch(source_message.get("created_at")),
+                )
+                set_last_seen(group_id, message_id)
+
+            if await self.hold_if_rate_limited(
+                bridge,
+                DIRECTION_TO_DISCORD,
+                str(message.get("user_id") or ""),
+                f"{message.get('name') or 'GroupMe user'} (GroupMe)",
+                message_id,
+                lambda: self.process_groupme_message(
+                    source_message, source=source, check_rate_limit=False
+                ),
+                drop_held,
+            ):
+                return
         message = await resolve_groupme_reply(
             self.groupme_session, group_id, message
         )
@@ -3912,10 +4156,127 @@ class Bot(discord.Client):
         bridge = bridge_for_destination(bridged_channel_id(message))
         if bridge is None:
             return
+        if await self.hold_if_rate_limited(
+            bridge,
+            DIRECTION_TO_GROUPME,
+            str(message.author.id),
+            f"{message.author.display_name} (<@{message.author.id}>)",
+            str(message.id),
+            lambda: self.relay_to_groupme(message, bridge),
+            notice_channel=message.channel,
+        ):
+            return
+        await self.relay_to_groupme(message, bridge)
+
+    async def relay_to_groupme(self, message: discord.Message, bridge: sqlite3.Row) -> None:
         try:
             await relay_discord_message(self.groupme_session, message, bridge, self)
         except (GroupMeError, discord.HTTPException):
             log.exception("Could not relay Discord message %s to GroupMe", message.id)
+
+    # -- rate limiting ------------------------------------------------------ #
+
+    async def hold_if_rate_limited(
+        self,
+        bridge: sqlite3.Row,
+        direction: str,
+        user_id: str,
+        user_label: str,
+        item_id: str,
+        release: Callable[[], Awaitable[None]],
+        drop: Callable[[], None] | None = None,
+        notice_channel: discord.abc.Messageable | None = None,
+    ) -> bool:
+        """Hold the message when its sender is over the limit on this bridge."""
+        if not RATE_LIMIT_ENABLED or direction not in RATE_LIMIT_DIRECTIONS:
+            return False
+        trip, is_new = RATE_LIMITER.check(
+            str(bridge["conversation_id"]), direction, user_id, user_label
+        )
+        if trip is None:
+            return False
+        trip.hold(item_id, release, drop)
+        if is_new:
+            log.warning(
+                "Rate limit tripped for %s on %s (%s): %s",
+                user_id,
+                bridge["conversation_id"],
+                direction,
+                trip.reason,
+            )
+            if not await self.send_rate_limit_alert(bridge, trip):
+                # Nobody can answer an alert that was never delivered, so fail open.
+                await self.finish_rate_limit(trip, allow=True)
+            elif notice_channel is not None:
+                await self.send_rate_limit_notice(notice_channel, trip)
+        return True
+
+    async def send_rate_limit_notice(
+        self, channel: discord.abc.Messageable, trip: RateLimitTrip
+    ) -> None:
+        """Tell the sender in their own channel; silent so nobody is pinged."""
+        try:
+            await channel.send(
+                f"<@{trip.user_id}> you're typing too fast. Your messages to GroupMe are "
+                "paused until a moderator reviews them.",
+                silent=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            log.exception("Could not post the rate limit notice for %s", trip.user_id)
+
+    def moderator_channel(self, bridge: sqlite3.Row) -> discord.abc.Messageable | None:
+        guild = getattr(self.get_channel(int(bridge["channel_id"])), "guild", None)
+        if guild is None:
+            return None
+        wanted = MODERATOR_CHANNEL_NAME.casefold()
+        return discord.utils.find(
+            lambda channel: channel.name.casefold() == wanted, guild.text_channels
+        )
+
+    async def send_rate_limit_alert(self, bridge: sqlite3.Row, trip: RateLimitTrip) -> bool:
+        channel = self.moderator_channel(bridge)
+        if channel is None:
+            log.warning(
+                "No #%s channel found for the rate limit alert on %s",
+                MODERATOR_CHANNEL_NAME,
+                bridge["conversation_id"],
+            )
+            return False
+        view = RateLimitView(self, trip)
+        try:
+            view.message = await channel.send(
+                embed=rate_limit_embed(
+                    trip,
+                    "**Suppress** drops the held messages; **Allow** relays them. "
+                    "Either one resumes this sender's normal relaying.",
+                    discord.Color.orange(),
+                ),
+                view=view,
+            )
+        except discord.HTTPException:
+            log.exception("Could not post the rate limit alert in #%s", MODERATOR_CHANNEL_NAME)
+            return False
+        return True
+
+    async def finish_rate_limit(self, trip: RateLimitTrip, *, allow: bool) -> None:
+        """Resume the bridge direction, relaying or dropping what was held."""
+        RATE_LIMITER.resolve(trip)
+        for release, drop in list(trip.held.values()):
+            if allow:
+                try:
+                    await release()
+                except Exception:
+                    log.exception("Could not relay a held message for %s", trip.conversation_id)
+            elif drop is not None:
+                drop()
+        log.info(
+            "Rate limit on %s (%s) %s: %d held message(s)",
+            trip.conversation_id,
+            trip.direction,
+            "allowed" if allow else "suppressed",
+            len(trip.held),
+        )
 
     async def on_raw_message_edit(self, payload) -> None:
         if payload.guild_id is None or "content" not in payload.data:
